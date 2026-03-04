@@ -1,0 +1,110 @@
+﻿#ifndef APPMANAGERSERVICE_H
+#define APPMANAGERSERVICE_H
+
+#include "apptypes.h"
+
+#include <functional>
+#include <QHash>
+#include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QObject>
+#include <QVector>
+
+/**
+ * @brief 多应用管理服务。
+ *
+ * 负责：
+ * 1) 读取本地配置并构建应用列表；
+ * 2) 检查本地文件完整性与本地版本；
+ * 3) 向服务端请求在线版本信息；
+ * 4) 下载并执行“替换可执行文件”式升级。
+ */
+class AppManagerService : public QObject
+{
+    Q_OBJECT
+
+public:
+    using DownloadProgressCallback = std::function<void(qint64 receivedBytes, qint64 totalBytes)>;
+    using StatusCallback = std::function<void(const QString &status)>;
+    using InstallProgressCallback = std::function<void(int percent)>;
+
+    explicit AppManagerService(QObject *parent = nullptr);
+
+    bool loadConfig(const QString &configPath, QString &errorMessage);
+
+    QString appsRoot() const;
+    QVector<AppConfig> apps() const;
+
+    QString appAbsoluteDir(const AppConfig &app) const;
+    QString appAbsoluteExePath(const AppConfig &app) const;
+    QString appCurrentVersion(const AppConfig &app) const;
+
+    bool checkRequiredFiles(const AppConfig &app, QStringList &missingFiles) const;
+
+    /**
+     * @brief 在线检查一个应用是否有更新。
+     */
+    OnlineAppInfo checkOnlineInfo(const AppConfig &app, int timeoutMs = 10000);
+
+    /**
+     * @brief 升级指定应用。
+     * @param app 要升级的应用配置。
+     * @param online 在线信息（包含最新版本和下载地址）。
+     * @param resultMessage 输出执行结果信息。
+     * @return true 升级成功；false 升级失败。
+     */
+    bool upgradeApp(const AppConfig &app,
+                    const OnlineAppInfo &online,
+                    QString &resultMessage,
+                    int timeoutMs = 30000,
+                    const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                    const StatusCallback &statusCallback = StatusCallback(),
+                    const InstallProgressCallback &installProgressCallback = InstallProgressCallback());
+
+    /**
+     * @brief 检查依赖文件完整性，不完整时下载并解压完整包。
+     * @return true 依赖完整（或已修复）；false 修复失败。
+     */
+    bool checkAndFixDependencies(const AppConfig &app,
+                                 const OnlineAppInfo &online,
+                                 QString &resultMessage,
+                                 int timeoutMs = 180000,
+                                 const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                                 const StatusCallback &statusCallback = StatusCallback(),
+                                 const InstallProgressCallback &installProgressCallback = InstallProgressCallback());
+
+private:
+    QByteArray httpGet(const QUrl &url,
+                       QString &errorMessage,
+                       int timeoutMs,
+                       const DownloadProgressCallback &progressCallback = DownloadProgressCallback()) const;
+    bool downloadFileWithResume(const QUrl &url,
+                                const QString &targetFilePath,
+                                QString &errorMessage,
+                                int timeoutMs,
+                                const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                                const StatusCallback &statusCallback = StatusCallback()) const;
+    QStringList loadZipReplaceFileList(QString &errorMessage) const;
+    QString resolvePath(const QString &relativePath) const;
+    bool upgradeByExeReplace(const AppConfig &app,
+                             const OnlineAppInfo &online,
+                             const QString &packageFilePath,
+                             QString &resultMessage,
+                             const StatusCallback &statusCallback,
+                             const InstallProgressCallback &installProgressCallback) const;
+    bool upgradeByZipExtract(const AppConfig &app,
+                             const OnlineAppInfo &online,
+                             const QString &zipFilePath,
+                             QString &resultMessage,
+                             const StatusCallback &statusCallback,
+                             const InstallProgressCallback &installProgressCallback) const;
+
+private:
+    QString m_appsRoot;
+    QVector<AppConfig> m_apps;
+
+    // QNAM 复用连接池，提升多个应用检查/下载时的效率。
+    mutable QNetworkAccessManager m_networkManager;
+};
+
+#endif // APPMANAGERSERVICE_H

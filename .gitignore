@@ -1,0 +1,5 @@
+build/Desktop_Qt_5_15_2_MinGW_32_bit-Release/*
+build_release/*
+debug/*
+release/*
+.svn/

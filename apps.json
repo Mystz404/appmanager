@@ -1,0 +1,37 @@
+﻿{
+  "appsRoot": ".",
+  "versionStoreFile": "versions.json",
+  "apps": [
+    {
+      "id": "bctester",
+      "name": "BCMU上位机",
+      "exe": "managed_apps/BCTester.exe",
+      "versionKey": "bctester",
+      "requiredFiles": [
+        "managed_apps/bctester.ini"
+      ],
+      "updateMetaUrl": "http://127.0.0.1:8080/updates/bctester.json"
+    },
+    {
+      "id": "bmsverup",
+      "name": "BMS固件升级工具",
+      "exe": "managed_apps/ReportCenter/ReportCenter.exe",
+      "versionKey": "bmsverup",
+      "requiredFiles": [
+        "managed_apps/ReportCenter/settings.json",
+        "managed_apps/ReportCenter/templates/default.tpl"
+      ],
+      "updateMetaUrl": "http://127.0.0.1:8080/updates/bmsverup.json"
+    },
+    {
+      "id": "app_data_sync",
+      "name": "数据同步器",
+      "exe": "managed_apps/DataSync/DataSync.exe",
+      "versionKey": "app_data_sync",
+      "requiredFiles": [
+        "managed_apps/DataSync/sync_rules.json"
+      ],
+      "updateMetaUrl": "http://127.0.0.1:8080/updates/app_data_sync.json"
+    }
+  ]
+}
