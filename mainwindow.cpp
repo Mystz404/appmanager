@@ -19,6 +19,20 @@
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <QApplication>
+#include <QDialogButtonBox>
+#include <QDesktopServices>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMenu>
+#include <QMessageBox>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QProgressDialog>
+#include <QAbstractItemView>
+#include <QStyledItemDelegate>
+#include <QTimer>
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
@@ -40,7 +54,198 @@ static BOOL CALLBACK enumWindowsCallback(HWND hwnd, LPARAM lParam)
     }
     return TRUE;
 }
+
+static QString compactStatusText(const QString &text, int maxLen = 120)
+{
+    QString oneLine = text;
+    oneLine.replace('\n', ' ');
+    oneLine = oneLine.simplified();
+    if (oneLine.size() <= maxLen) {
+        return oneLine;
+    }
+    const int half = (maxLen - 5) / 2;
+    return oneLine.left(half) + QStringLiteral(" ... ") + oneLine.right(half);
+}
+
+static QString normalizeWindowsPath(const QString &path)
+{
+    return QDir::toNativeSeparators(QDir::cleanPath(path)).toLower();
+}
+
+static QString processImagePathByPid(DWORD pid)
+{
+    HANDLE modSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (modSnap == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    QString result;
+    MODULEENTRY32W me;
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(modSnap, &me)) {
+        result = QString::fromWCharArray(me.szExePath);
+    }
+
+    CloseHandle(modSnap);
+    return result;
+}
+
+static DWORD findRunningProcessIdByPath(const QString &targetExePath)
+{
+    const QString targetNorm = normalizeWindowsPath(QFileInfo(targetExePath).absoluteFilePath());
+    const QString targetExeName = QFileInfo(targetNorm).fileName();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    DWORD foundPid = 0;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            const QString runningExeName = QString::fromWCharArray(pe.szExeFile);
+            if (runningExeName.compare(targetExeName, Qt::CaseInsensitive) != 0) {
+                continue;
+            }
+
+            const QString runningPath = normalizeWindowsPath(processImagePathByPid(pe.th32ProcessID));
+            if (!runningPath.isEmpty() && runningPath == targetNorm) {
+                foundPid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return foundPid;
+}
 #endif
+
+// ============================================================
+// 自定义列表项代理（卡片布局）
+// ============================================================
+class AppItemDelegate : public QStyledItemDelegate
+{
+public:
+    explicit AppItemDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent) {}
+
+    QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &) const override
+    {
+        return QSize(140, 195);
+    }
+
+    // 返回 … 按鈕在视口坐标系中的区域
+    static QRect moreButtonRect(const QRect &itemRect)
+    {
+        return QRect(itemRect.right() - 36, itemRect.top() + 6, 32, 18);
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+
+        const QRect r = option.rect.adjusted(2, 2, -2, -2);
+        const bool selected = (option.state & QStyle::State_Selected) != 0;
+        const bool hovered  = (option.state & QStyle::State_MouseOver) != 0;
+
+        // 卡片背景
+        QColor bgColor     = selected ? QColor(219, 234, 254)
+                                      : (hovered ? QColor(239, 246, 255) : Qt::white);
+        QColor borderColor = selected ? QColor(59, 130, 246)
+                                      : (hovered ? QColor(147, 197, 253) : QColor(226, 232, 240));
+        painter->setPen(QPen(borderColor, 1));
+        painter->setBrush(bgColor);
+        painter->drawRoundedRect(r, 10, 10);
+
+        // 图标
+        const QIcon icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
+        const int iconSize = 64;
+        const QRect iconRect(r.left() + (r.width() - iconSize) / 2, r.top() + 14, iconSize, iconSize);
+        if (!icon.isNull()) {
+            icon.paint(painter, iconRect);
+        }
+
+        // 应用名称
+        const QString name    = index.data(Qt::DisplayRole).toString();
+        const QString version = index.data(Qt::UserRole + 2).toString();
+        const QString status  = index.data(Qt::UserRole + 3).toString();
+        const bool hasUpdate  = index.data(Qt::UserRole + 4).toBool();
+
+        {
+            QFont nf;
+            nf.setPixelSize(14);
+            painter->setFont(nf);
+            painter->setPen(selected ? QColor(30, 58, 138) : QColor(31, 41, 55));
+            const QRect nameRect(r.left() + 4, r.top() + 84, r.width() - 8, 44);
+            painter->drawText(nameRect, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, name);
+        }
+
+        // 版本号（小字）
+        if (!version.isEmpty()) {
+            QFont vf;
+            vf.setPixelSize(12);
+            painter->setFont(vf);
+            painter->setPen(QColor(107, 114, 128));
+            const QRect vRect(r.left() + 4, r.top() + 130, r.width() - 8, 18);
+            painter->drawText(vRect, Qt::AlignHCenter | Qt::AlignVCenter, version);
+        }
+
+        // 状态徽章（右下角）
+        if (!status.isEmpty()) {
+            QColor badgeFg, badgeBg;
+            if (hasUpdate) {
+                badgeFg = QColor(146, 64, 14);
+                badgeBg = QColor(254, 243, 199);
+            } else if (status == QStringLiteral("下载")) {
+                badgeFg = QColor(30, 64, 175);
+                badgeBg = QColor(219, 234, 254);
+            } else {
+                // 就绪状态不显示徽章
+                goto draw_more_btn;
+            }
+            {
+                QFont bf;
+                bf.setPixelSize(11);
+                painter->setFont(bf);
+                QFontMetrics fm(bf);
+                const int badgeW = fm.horizontalAdvance(status) + 10;
+                const int badgeH = 16;
+                const QRect badgeRect(r.right() - badgeW - 3, r.bottom() - badgeH - 3, badgeW, badgeH);
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(badgeBg);
+                painter->drawRoundedRect(badgeRect, 7, 7);
+                painter->setPen(badgeFg);
+                painter->drawText(badgeRect, Qt::AlignCenter, status);
+            }
+        }
+
+        draw_more_btn:
+        // … 按鈕（右上角）
+        {
+            const QRect mbr = moreButtonRect(option.rect);
+            painter->setPen(Qt::NoPen);
+            if (hovered || selected) {
+                painter->setBrush(QColor(186, 199, 214));
+            } else {
+                painter->setBrush(QColor(220, 228, 238));
+            }
+            painter->drawRoundedRect(mbr, 5, 5);
+            QFont mf;
+            mf.setPixelSize(8);
+            mf.setBold(true);
+            painter->setFont(mf);
+            painter->setPen(QColor(255, 255, 255));
+            painter->drawText(mbr, Qt::AlignCenter, QStringLiteral("···"));
+        }
+
+        painter->restore();
+    }
+};
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -61,8 +266,11 @@ MainWindow::MainWindow(QWidget *parent)
 
     // 初始化状态栏提示
     if (statusBar()) {
-        statusBar()->showMessage(QStringLiteral("未检测服务器连接状态"));
+        statusBar()->showMessage(QStringLiteral("正在连接服务器..."));
     }
+
+    // 延迟检测服务器连接状态
+    QTimer::singleShot(500, this, &MainWindow::checkServerConnection);
 }
 
 MainWindow::~MainWindow()
@@ -81,24 +289,22 @@ void MainWindow::setupUiWidgets()
     m_titleLabel->setObjectName(QStringLiteral("titleLabel"));
 
     auto *buttonLayout = new QHBoxLayout();
-    m_checkRequiredButton = new QPushButton(QStringLiteral("检测必需文件"), root);
     m_checkUpdatesButton = new QPushButton(QStringLiteral("在线检测更新"), root);
 
-    buttonLayout->addWidget(m_checkRequiredButton);
     buttonLayout->addWidget(m_checkUpdatesButton);
     buttonLayout->addStretch();
 
     m_appList = new QListWidget(root);
     m_appList->setViewMode(QListView::IconMode);
-    m_appList->setIconSize(QSize(96, 96));
+    m_appList->setIconSize(QSize(72, 72));
     m_appList->setResizeMode(QListView::Adjust);
     m_appList->setMovement(QListView::Static);
-    m_appList->setGridSize(QSize(160, 170));
-    m_appList->setSpacing(12);
+    m_appList->setGridSize(QSize(152, 208));
+    m_appList->setSpacing(6);
     m_appList->setWordWrap(true);
-    m_appList->setUniformItemSizes(true);
+    m_appList->setContextMenuPolicy(Qt::CustomContextMenu);
 
-    auto *hintLabel = new QLabel(QStringLiteral("点击下方应用图标即可快捷启动"), root);
+    auto *hintLabel = new QLabel(QStringLiteral("点击图标启动应用 | 右键点击显示更多选项"), root);
     hintLabel->setObjectName(QStringLiteral("hintLabel"));
 
     // 日志面板
@@ -117,11 +323,15 @@ void MainWindow::setupUiWidgets()
     mainLayout->addWidget(m_appList, 3);
     mainLayout->addWidget(logLabel);
     mainLayout->addWidget(m_logView, 1);
+
+    // 自定义代理 + 禁用右键菜单（改用 ··· 按鈕）
+    m_appList->setItemDelegate(new AppItemDelegate(m_appList));
+    m_appList->setContextMenuPolicy(Qt::NoContextMenu);
+    m_appList->viewport()->installEventFilter(this);
 }
 
 void MainWindow::connectSignals()
 {
-    connect(m_checkRequiredButton, &QPushButton::clicked, this, &MainWindow::onCheckRequiredFiles);
     connect(m_checkUpdatesButton, &QPushButton::clicked, this, &MainWindow::onCheckUpdates);
     connect(m_appList, &QListWidget::itemClicked, this, &MainWindow::onAppIconClicked);
 }
@@ -140,12 +350,19 @@ void MainWindow::applySimpleStyle()
             "QPushButton:hover { background: #1d4ed8; }"
             "QPushButton:pressed { background: #1e40af; }"
             "QListWidget {"
-            "  background: white; border: 1px solid #dbe2ea; border-radius: 10px;"
+            "  background: #f1f5f9; border: 1px solid #dbe2ea; border-radius: 10px;"
+            "  padding: 6px;"
             "}"
             "QListWidget::item {"
-            "  border-radius: 8px; padding: 8px;"
+            "  border-radius: 10px; padding: 4px 2px;"
+            "  border: 1px solid #e2e8f0;"
+            "  background: #ffffff;"
             "}"
-            "QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }"
+            "QListWidget::item:hover {"
+            "  background: #eff6ff;"
+            "  border: 1px solid #93c5fd;"
+            "}"
+            "QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; border: 1px solid #3b82f6; }"
             "QLabel#logLabel { font-size: 14px; font-weight: 600; color: #374151; }"
             "QPlainTextEdit#logView {"
             "  background: #1e293b; color: #a3e635;"
@@ -198,10 +415,47 @@ void MainWindow::loadConfig()
     for (const AppConfig &app : m_service.apps()) {
         m_appById.insert(app.id, app);
     }
+
+    validateLocalApps();
+
     refreshAppIcons();
     logToFile(QStringLiteral("配置加载成功，共 %1 个应用，根目录: %2")
                   .arg(m_service.apps().size())
                   .arg(QDir::toNativeSeparators(m_service.appsRoot())));
+}
+
+void MainWindow::validateLocalApps()
+{
+    QStringList toRemove;
+    for (auto it = m_appById.constBegin(); it != m_appById.constEnd(); ++it) {
+        const AppConfig &app = it.value();
+        const QString exePath = m_service.appAbsoluteExePath(app);
+        if (!QFileInfo::exists(exePath)) {
+            toRemove.append(app.id);
+            logToFile(QStringLiteral("[%1] 本地文件不存在，已从配置移除: %2")
+                          .arg(app.name, QDir::toNativeSeparators(exePath)));
+        }
+    }
+
+    if (toRemove.isEmpty()) {
+        return;
+    }
+
+    for (const QString &id : toRemove) {
+        m_service.removeAppEntry(id);
+        m_appById.remove(id);
+        m_onlineCache.remove(id);
+    }
+
+    QString err;
+    if (!m_service.saveConfig(err)) {
+        logToFile(QStringLiteral("清理不存在的应用后保存配置失败: %1").arg(err));
+    }
+
+    // 有应用被移除，重新获取服务器清单
+    fetchRemoteCatalog();
+
+    refreshAppIcons();
 }
 
 void MainWindow::refreshAppIcons()
@@ -210,6 +464,7 @@ void MainWindow::refreshAppIcons()
     m_appList->clear();
     QFileIconProvider provider;
 
+    // 1) 本地已有的应用
     for (const AppConfig &app : apps) {
         const QString exePath = m_service.appAbsoluteExePath(app);
         QIcon icon = provider.icon(QFileInfo(exePath));
@@ -219,17 +474,44 @@ void MainWindow::refreshAppIcons()
 
         const QString currentVersion = m_service.appCurrentVersion(app);
         const OnlineAppInfo online = m_onlineCache.value(app.id);
-        QString status = QStringLiteral("就绪");
-        if (online.requestSuccess && compareVersions(currentVersion, online.latestVersion) < 0) {
-            status = QStringLiteral("可升级到 %1").arg(online.latestVersion);
-        }
+        const bool hasUpdate = online.requestSuccess
+                               && compareVersions(currentVersion, online.latestVersion) < 0;
+        const QString status = hasUpdate ? QStringLiteral("可升级") : QString();
 
-        auto *item = new QListWidgetItem(icon,
-                                         QStringLiteral("%1\nV%2\n%3")
-                                             .arg(app.name, currentVersion, status));
-        item->setData(Qt::UserRole, app.id);
+        auto *item = new QListWidgetItem(icon, app.name);
+        item->setData(Qt::UserRole,     app.id);
+        item->setData(Qt::UserRole + 1, false);                      // isRemote
+        item->setData(Qt::UserRole + 2, QStringLiteral("V%1").arg(currentVersion)); // version
+        item->setData(Qt::UserRole + 3, status);                     // status badge
+        item->setData(Qt::UserRole + 4, hasUpdate);                  // hasUpdate
         item->setTextAlignment(Qt::AlignHCenter);
-        item->setToolTip(QDir::toNativeSeparators(exePath));
+        item->setSizeHint(QSize(120, 160));
+        if (hasUpdate) {
+            item->setToolTip(QStringLiteral("当前: V%1，最新: V%2")
+                                 .arg(currentVersion, online.latestVersion));
+        } else {
+            item->setToolTip(QDir::toNativeSeparators(exePath));
+        }
+        m_appList->addItem(item);
+    }
+
+    // 2) 服务器上本地不存在的应用
+    for (auto it = m_remoteCatalog.constBegin(); it != m_remoteCatalog.constEnd(); ++it) {
+        const QJsonObject &info = it.value();
+        QIcon icon = createDownloadIcon(96);
+
+        const QString appName = info.value(QStringLiteral("appName")).toString();
+        const QString version = info.value(QStringLiteral("latestVersion")).toString();
+
+        auto *item = new QListWidgetItem(icon, appName);
+        item->setData(Qt::UserRole,     it.key());
+        item->setData(Qt::UserRole + 1, true);                              // isRemote
+        item->setData(Qt::UserRole + 2, QStringLiteral("V%1").arg(version)); // version
+        item->setData(Qt::UserRole + 3, QStringLiteral("下载"));              // status badge
+        item->setData(Qt::UserRole + 4, false);                             // hasUpdate
+        item->setTextAlignment(Qt::AlignHCenter);
+        item->setSizeHint(QSize(120, 160));
+        item->setToolTip(QStringLiteral("点击下载该应用"));
         m_appList->addItem(item);
     }
 }
@@ -250,24 +532,8 @@ bool MainWindow::launchAppById(const QString &appId)
     const QString exePath = m_service.appAbsoluteExePath(app);
 
 #ifdef Q_OS_WIN
-    // 检查该 EXE 是否已在运行，若已运行则将其窗口调到前台
-    const QString exeName = QFileInfo(exePath).fileName();
-    DWORD targetPid = 0;
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (exeName.compare(QString::fromWCharArray(pe.szExeFile), Qt::CaseInsensitive) == 0) {
-                    targetPid = pe.th32ProcessID;
-                    break;
-                }
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-    }
+    // 检查“同完整路径 EXE”是否已在运行，避免仅按文件名导致误判
+    const DWORD targetPid = findRunningProcessIdByPath(exePath);
 
     if (targetPid != 0) {
         // 已运行，枚举窗口并调到前台
@@ -282,9 +548,14 @@ bool MainWindow::launchAppById(const QString &appId)
             logToFile(QStringLiteral("[%1] 已在运行，已将窗口调到前台").arg(app.name));
             return true;
         }
-        // 进程存在但未找到可见窗口，记录日志后不重复启动
-        logToFile(QStringLiteral("[%1] 已在运行（未找到可见窗口）").arg(app.name));
-        return true;
+
+        // 同路径进程存在但未找到可见窗口，尝试再次拉起
+        const bool restarted = QProcess::startDetached(exePath, {});
+        logToFile(QStringLiteral("[%1] %2")
+                      .arg(app.name,
+                           restarted ? QStringLiteral("检测到同路径进程但无可见窗口，已尝试重新启动")
+                                     : QStringLiteral("检测到同路径进程且无可见窗口，重新启动失败")));
+        return restarted;
     }
 #endif
 
@@ -293,30 +564,44 @@ bool MainWindow::launchAppById(const QString &appId)
     return started;
 }
 
-void MainWindow::onCheckRequiredFiles()
+void MainWindow::startUpdateWorkflow(const QVector<AppConfig> &apps)
 {
-    const QVector<AppConfig> apps = m_service.apps();
     if (apps.isEmpty()) {
         return;
     }
 
-    int brokenCount = 0;
-    for (const AppConfig &app : apps) {
-        QStringList missing;
-        const bool ok = m_service.checkRequiredFiles(app, missing);
-        if (!ok) {
-            ++brokenCount;
-            logToFile(QStringLiteral("[%1] 缺失文件: %2").arg(app.name, missing.join(QStringLiteral(", "))));
+    auto *dlg = new UpdateDialog(&m_service, apps, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+    dlg->setModal(false);
+    dlg->setWindowModality(Qt::NonModal);
+    connect(dlg, &UpdateDialog::logMessage, this, &MainWindow::logToFile);
+
+    connect(dlg, &QDialog::finished, this, [this, dlg, apps](int) {
+        const QHash<QString, OnlineAppInfo> cache = dlg->onlineCache();
+        for (auto it = cache.constBegin(); it != cache.constEnd(); ++it) {
+            m_onlineCache.insert(it.key(), it.value());
         }
-    }
 
-    if (brokenCount == 0) {
-        logToFile(QStringLiteral("所有应用的必需文件检测通过"));
-    } else {
-        logToFile(QStringLiteral("必需文件检测完成，异常应用数: %1").arg(brokenCount));
-    }
+        const int total = apps.size();
+        const int success = dlg->serverSuccessCount();
+        if (statusBar()) {
+            if (success == total) {
+                statusBar()->showMessage(QStringLiteral("已成功连接至服务器，全部应用在线检测通过"), 8000);
+            } else if (success > 0) {
+                statusBar()->showMessage(QStringLiteral("部分应用连接服务器成功，%1 个失败").arg(total - success), 8000);
+            } else {
+                statusBar()->showMessage(QStringLiteral("无法连接服务器，全部应用检测失败"), 8000);
+            }
+        }
 
-    refreshAppIcons();
+        refreshAppIcons();
+        fetchRemoteCatalog();
+        refreshAppIcons();
+    });
+
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
 }
 
 void MainWindow::onCheckUpdates()
@@ -325,28 +610,7 @@ void MainWindow::onCheckUpdates()
     if (apps.isEmpty()) {
         return;
     }
-
-    UpdateDialog dlg(&m_service, apps, this);
-    connect(&dlg, &UpdateDialog::logMessage, this, &MainWindow::logToFile);
-    dlg.exec();
-
-    // 同步在线缓存用于图标刷新
-    m_onlineCache = dlg.onlineCache();
-
-    // 状态栏反映服务器连接状态
-    const int total = apps.size();
-    const int success = dlg.serverSuccessCount();
-    if (statusBar()) {
-        if (success == total) {
-            statusBar()->showMessage(QStringLiteral("已成功连接至服务器，全部应用在线检测通过"), 8000);
-        } else if (success > 0) {
-            statusBar()->showMessage(QStringLiteral("部分应用连接服务器成功，%1 个失败").arg(total - success), 8000);
-        } else {
-            statusBar()->showMessage(QStringLiteral("无法连接服务器，全部应用检测失败"), 8000);
-        }
-    }
-
-    refreshAppIcons();
+    startUpdateWorkflow(apps);
 }
 
 void MainWindow::onAppIconClicked(QListWidgetItem *item)
@@ -356,5 +620,625 @@ void MainWindow::onAppIconClicked(QListWidgetItem *item)
     }
 
     const QString appId = item->data(Qt::UserRole).toString();
-    launchAppById(appId);
+    const bool isRemote = item->data(Qt::UserRole + 1).toBool();
+
+    if (isRemote) {
+        onDownloadRemoteApp(appId);
+    } else {
+        launchAppById(appId);
+    }
+}
+
+// ============================================================
+// 服务器连接检测
+// ============================================================
+
+void MainWindow::checkServerConnection()
+{
+    if (m_service.serverBaseUrl().isEmpty()) {
+        if (statusBar()) {
+            statusBar()->showMessage(QStringLiteral("未配置服务器地址"));
+        }
+        return;
+    }
+
+    m_serverConnected = m_service.tryConnectServer(3000);
+    if (statusBar()) {
+        if (m_serverConnected) {
+            statusBar()->showMessage(QStringLiteral("已连接服务器"));
+        } else {
+            statusBar()->showMessage(QStringLiteral("无法连接服务器"));
+        }
+    }
+
+    // 连接成功后获取应用清单
+    if (m_serverConnected) {
+        fetchRemoteCatalog();
+        refreshAppIcons();
+    }
+}
+
+void MainWindow::fetchRemoteCatalog()
+{
+    if (!m_serverConnected) {
+        m_serverConnected = m_service.tryConnectServer(3000);
+        if (!m_serverConnected) {
+            return;
+        }
+    }
+
+    QJsonArray catalog = m_service.fetchAppCatalog();
+    m_remoteCatalog.clear();
+    for (const QJsonValue &v : catalog) {
+        QJsonObject item = v.toObject();
+        QString catalogAppId = item.value(QStringLiteral("appId")).toString();
+        if (!m_appById.contains(catalogAppId)) {
+            m_remoteCatalog.insert(catalogAppId, item);
+        }
+    }
+    if (!m_remoteCatalog.isEmpty()) {
+        logToFile(QStringLiteral("有 %1 个应用未安装").arg(m_remoteCatalog.size()));
+    }
+}
+
+// ============================================================
+// 视口事件过滤：拦截 ··· 按钮点击
+// ============================================================
+
+bool MainWindow::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == m_appList->viewport() && event->type() == QEvent::MouseButtonRelease) {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::LeftButton) {
+            const QModelIndex idx = m_appList->indexAt(me->pos());
+            if (idx.isValid()) {
+                const QRect itemRect = m_appList->visualRect(idx);
+                if (AppItemDelegate::moreButtonRect(itemRect).contains(me->pos())) {
+                    const QString appId = idx.data(Qt::UserRole).toString();
+                    showAppContextMenu(appId, m_appList->viewport()->mapToGlobal(me->pos()));
+                    return true; // 消耗事件，阻止 itemClicked 触发
+                }
+            }
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
+}
+
+// ============================================================
+// 应用上下文菜单
+// ============================================================
+
+void MainWindow::showAppContextMenu(const QString &appId, const QPoint &globalPos)
+{
+    const bool isRemote = !m_appById.contains(appId);
+
+    QMenu menu(this);
+
+    if (isRemote) {
+        menu.addAction(QStringLiteral("下载应用"), this, [this, appId]() {
+            onDownloadRemoteApp(appId);
+        });
+    } else {
+        menu.addAction(QStringLiteral("打开应用"), this, [this, appId]() {
+            launchAppById(appId);
+        });
+        menu.addAction(QStringLiteral("打开文件位置"), this, [this, appId]() {
+            onOpenAppLocation(appId);
+        });
+
+        // 有可用升级时显示升级选项
+        const OnlineAppInfo online = m_onlineCache.value(appId);
+        const QString currentVersion = m_service.appCurrentVersion(m_appById.value(appId));
+        if (online.requestSuccess && compareVersions(currentVersion, online.latestVersion) < 0) {
+            menu.addSeparator();
+            menu.addAction(QStringLiteral("升级到 V%1").arg(online.latestVersion), this, [this, appId]() {
+                const QVector<AppConfig> singleApp = { m_appById.value(appId) };
+                startUpdateWorkflow(singleApp);
+            });
+        }
+
+        menu.addSeparator();
+
+        menu.addAction(QStringLiteral("下载历史版本"), this, [this, appId]() {
+            onDownloadHistoryVersion(appId);
+        });
+
+        menu.addSeparator();
+
+        menu.addAction(QStringLiteral("删除应用"), this, [this, appId]() {
+            onDeleteApp(appId);
+        });
+    }
+
+    menu.exec(globalPos);
+}
+
+// ============================================================
+// 打开文件位置
+// ============================================================
+
+void MainWindow::onOpenAppLocation(const QString &appId)
+{
+    const AppConfig app = m_appById.value(appId);
+    if (app.id.isEmpty()) {
+        return;
+    }
+
+    const QString exePath = m_service.appAbsoluteExePath(app);
+    const QString appDir = m_service.appAbsoluteDir(app);
+
+#ifdef Q_OS_WIN
+    bool opened = false;
+    if (QFileInfo::exists(exePath)) {
+        opened = QProcess::startDetached(
+            QStringLiteral("explorer.exe"),
+            { QStringLiteral("/select,"), QDir::toNativeSeparators(exePath) });
+    }
+    if (!opened) {
+        opened = QProcess::startDetached(
+            QStringLiteral("explorer.exe"),
+            { QDir::toNativeSeparators(appDir) });
+    }
+#else
+    const bool opened = QDesktopServices::openUrl(QUrl::fromLocalFile(appDir));
+#endif
+
+    if (!opened) {
+        logToFile(QStringLiteral("[%1] 打开文件位置失败: %2")
+                      .arg(app.name, QDir::toNativeSeparators(appDir)));
+    }
+}
+
+// ============================================================
+// 删除应用
+// ============================================================
+
+void MainWindow::onDeleteApp(const QString &appId)
+{
+    const AppConfig app = m_appById.value(appId);
+    if (app.id.isEmpty()) {
+        return;
+    }
+
+    const QString exePath = m_service.appAbsoluteExePath(app);
+    const QString appDir  = m_service.appAbsoluteDir(app);
+
+    QMessageBox msgBox(this);
+    msgBox.setWindowTitle(QStringLiteral("确认删除"));
+    msgBox.setText(QStringLiteral("确定要删除应用「%1」吗？\n\n将关闭正在运行的进程并删除磁盘文件。").arg(app.name));
+    msgBox.setStandardButtons(QMessageBox::Ok | QMessageBox::Cancel);
+    msgBox.button(QMessageBox::Ok)->setText(QStringLiteral("确定"));
+    msgBox.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
+    msgBox.setDefaultButton(QMessageBox::Cancel);
+
+    if (msgBox.exec() != QMessageBox::Ok) {
+        return;
+    }
+
+    const bool deleteFiles = true;
+
+    // 1) 关闭正在运行的进程
+#ifdef Q_OS_WIN
+    const QString exeName = QFileInfo(exePath).fileName();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (exeName.compare(QString::fromWCharArray(pe.szExeFile), Qt::CaseInsensitive) == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if (hProc) {
+                        TerminateProcess(hProc, 0);
+                        WaitForSingleObject(hProc, 3000);
+                        CloseHandle(hProc);
+                        logToFile(QStringLiteral("[%1] 已关闭运行中的进程").arg(app.name));
+                    }
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+#endif
+
+    // 2) 删除磁盘文件
+    if (deleteFiles) {
+        // 仅删除当前应用 EXE，避免共享目录下误删其他应用文件。
+        if (QFileInfo::exists(exePath)) {
+            if (QFile::remove(exePath)) {
+                logToFile(QStringLiteral("[%1] 已删除可执行文件: %2")
+                              .arg(app.name, QDir::toNativeSeparators(exePath)));
+            } else {
+                logToFile(QStringLiteral("[%1] 可执行文件删除失败: %2")
+                              .arg(app.name, QDir::toNativeSeparators(exePath)));
+            }
+        }
+
+        // 仅在目录未被其他应用共享且已为空时，尝试清理空目录。
+        const QString appsRoot = QDir::cleanPath(m_service.appsRoot());
+        const QString cleanDir = QDir::cleanPath(appDir);
+        bool usedByOtherApps = false;
+        for (auto it = m_appById.constBegin(); it != m_appById.constEnd(); ++it) {
+            if (it.key() == appId) {
+                continue;
+            }
+            const QString otherDir = QDir::cleanPath(m_service.appAbsoluteDir(it.value()));
+            if (otherDir == cleanDir) {
+                usedByOtherApps = true;
+                break;
+            }
+        }
+
+        if (!usedByOtherApps
+            && !cleanDir.isEmpty()
+            && cleanDir != appsRoot
+            && QDir(cleanDir).exists()) {
+            QDir dir(cleanDir);
+            if (dir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
+                QString currentDir = cleanDir;
+                while (!currentDir.isEmpty() && currentDir != appsRoot) {
+                    QDir d(currentDir);
+                    if (!d.exists() || !d.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
+                        break;
+                    }
+                    const QString parentDir = QFileInfo(currentDir).absolutePath();
+                    QDir().rmdir(currentDir);
+                    currentDir = parentDir;
+                }
+            }
+        }
+    }
+
+    // 3) 从配置中移除
+    m_service.removeAppEntry(appId);
+    m_appById.remove(appId);
+    m_onlineCache.remove(appId);
+
+    QString err;
+    if (m_service.saveConfig(err)) {
+        logToFile(QStringLiteral("已删除应用: %1").arg(app.name));
+        validateLocalApps();
+        fetchRemoteCatalog();
+        refreshAppIcons();
+    } else {
+        logToFile(QStringLiteral("删除应用后保存配置失败: %1").arg(err));
+    }
+}
+
+// ============================================================
+// 下载历史版本
+// ============================================================
+
+void MainWindow::onDownloadHistoryVersion(const QString &appId)
+{
+    if (!m_serverConnected) {
+        // 尝试重连
+        m_serverConnected = m_service.tryConnectServer(3000);
+        if (!m_serverConnected) {
+            logToFile(QStringLiteral("无法获取历史版本：未连接服务器"));
+            return;
+        }
+    }
+
+    const AppConfig app = m_appById.value(appId);
+    if (app.id.isEmpty()) {
+        return;
+    }
+
+    // 获取历史版本列表
+    logToFile(QStringLiteral("[%1] 正在获取历史版本列表...").arg(app.name));
+    QProgressDialog fetchProgress(QStringLiteral("正在获取历史版本列表..."), QString(), 0, 0, this);
+    fetchProgress.setWindowModality(Qt::NonModal);
+    fetchProgress.setCancelButton(nullptr);
+    fetchProgress.setAutoClose(true);
+    fetchProgress.setAutoReset(true);
+    fetchProgress.show();
+    QApplication::processEvents();
+
+    QJsonObject histMeta = m_service.fetchHistoryVersions(appId);
+    fetchProgress.close();
+    QJsonArray versions = histMeta.value(QStringLiteral("versions")).toArray();
+
+    if (versions.isEmpty()) {
+        logToFile(QStringLiteral("[%1] 没有可用的历史版本").arg(app.name));
+        return;
+    }
+
+    // 显示选择对话框
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("选择历史版本 - %1").arg(app.name));
+    dlg.setMinimumSize(420, 300);
+
+    auto *layout = new QVBoxLayout(&dlg);
+    auto *label = new QLabel(QStringLiteral("选择要下载的历史版本:"), &dlg);
+    layout->addWidget(label);
+
+    auto *list = new QListWidget(&dlg);
+    for (const QJsonValue &v : versions) {
+        QJsonObject vo = v.toObject();
+        QString text = QStringLiteral("v%1  -  %2")
+            .arg(vo.value(QStringLiteral("version")).toString(),
+                 vo.value(QStringLiteral("fileName")).toString());
+        auto *listItem = new QListWidgetItem(text, list);
+        listItem->setData(Qt::UserRole, v);
+    }
+    layout->addWidget(list);
+
+    auto *btnBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(btnBox);
+
+    if (dlg.exec() != QDialog::Accepted || !list->currentItem()) {
+        return;
+    }
+
+    // 获取选择的版本信息
+    QJsonObject selected = list->currentItem()->data(Qt::UserRole).toJsonObject();
+    QString version = selected.value(QStringLiteral("version")).toString();
+    QUrl downloadUrl(selected.value(QStringLiteral("downloadUrl")).toString());
+
+    // 确定保存路径：与原应用同目录
+    QString appDir = m_service.appAbsoluteDir(app);
+    QDir().mkpath(appDir);
+
+    // 构造版本化文件名：原始EXE基名_版本号.exe
+    QFileInfo origExeInfo(app.exeRelativePath);
+    QString histExeName = origExeInfo.completeBaseName() + QStringLiteral("_")
+                        + version + QStringLiteral(".") + origExeInfo.suffix();
+    QString targetPath = QDir(appDir).absoluteFilePath(histExeName);
+
+    // 下载
+    logToFile(QStringLiteral("[%1] 正在下载历史版本 v%2...").arg(app.name, version));
+    QProgressDialog dlProgress(QStringLiteral("[%1] 正在下载历史版本 v%2...").arg(app.name, version),
+                               QString(),
+                               0,
+                               100,
+                               this);
+    dlProgress.setWindowModality(Qt::NonModal);
+    dlProgress.setCancelButton(nullptr);
+    dlProgress.setAutoClose(true);
+    dlProgress.setAutoReset(true);
+    dlProgress.setValue(0);
+    dlProgress.show();
+    QApplication::processEvents();
+
+    QString err;
+    if (!m_service.downloadToFile(
+            downloadUrl,
+            targetPath,
+            err,
+            30000,
+            [&](qint64 received, qint64 total) {
+                if (total > 0) {
+                    const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
+                    dlProgress.setValue(p);
+                }
+                QApplication::processEvents();
+            },
+            [&](const QString &status) {
+                dlProgress.setLabelText(compactStatusText(QStringLiteral("[%1] %2").arg(app.name, status), 120));
+                QApplication::processEvents();
+            })) {
+        dlProgress.close();
+        logToFile(QStringLiteral("[%1] 下载失败: %2").arg(app.name, err));
+        return;
+    }
+    dlProgress.setValue(100);
+    dlProgress.close();
+
+    // 添加为新应用
+    AppConfig newApp;
+    newApp.id = appId + QStringLiteral("_") + QString(version).replace('.', '_');
+    newApp.name = app.name + QStringLiteral("_") + version;
+    newApp.exeRelativePath = QDir(m_service.appsRoot()).relativeFilePath(targetPath);
+    // 历史版本不设置 updateMetaUrl（无需在线更新）
+
+    m_service.addAppEntry(newApp);
+    m_appById.insert(newApp.id, newApp);
+
+    if (m_service.saveConfig(err)) {
+        logToFile(QStringLiteral("[%1] 历史版本 v%2 已添加为新应用: %3").arg(app.name, version, newApp.name));
+        refreshAppIcons();
+    } else {
+        logToFile(QStringLiteral("保存配置失败: %1").arg(err));
+    }
+}
+
+// ============================================================
+// 下载远程应用
+// ============================================================
+
+void MainWindow::onDownloadRemoteApp(const QString &appId)
+{
+    if (!m_remoteCatalog.contains(appId)) {
+        logToFile(QStringLiteral("未找到远程应用信息: %1").arg(appId));
+        return;
+    }
+
+    QJsonObject appInfo = m_remoteCatalog.value(appId);
+    QString appName = appInfo.value(QStringLiteral("appName")).toString();
+    QString pkgFile = appInfo.value(QStringLiteral("packageFileName")).toString();
+    QUrl downloadUrl(appInfo.value(QStringLiteral("downloadUrl")).toString());
+    QString subDir  = appInfo.value(QStringLiteral("subDir")).toString().trimmed();
+
+    // 保存路径：根据服务端配置的 subDir 决定存放位置
+    QString targetDir = m_service.appsRoot();
+    QString exeRel = pkgFile;
+    if (!subDir.isEmpty()) {
+        targetDir = QDir(m_service.appsRoot()).absoluteFilePath(subDir);
+        QDir().mkpath(targetDir);
+        exeRel = subDir + QStringLiteral("/") + pkgFile;
+    }
+    QString targetPath = QDir(targetDir).absoluteFilePath(pkgFile);
+
+    logToFile(QStringLiteral("正在下载: %1...").arg(appName));
+    QProgressDialog dlProgress(QStringLiteral("[%1] 正在下载应用...").arg(appName), QString(), 0, 100, this);
+    dlProgress.setWindowModality(Qt::NonModal);
+    dlProgress.setCancelButton(nullptr);
+    dlProgress.setAutoClose(true);
+    dlProgress.setAutoReset(true);
+    dlProgress.setValue(0);
+    dlProgress.show();
+    QApplication::processEvents();
+
+    QString err;
+    if (!m_service.downloadToFile(
+            downloadUrl,
+            targetPath,
+            err,
+            30000,
+            [&](qint64 received, qint64 total) {
+                if (total > 0) {
+                    const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
+                    dlProgress.setValue(p);
+                }
+                QApplication::processEvents();
+            },
+            [&](const QString &status) {
+                dlProgress.setLabelText(compactStatusText(QStringLiteral("[%1] %2").arg(appName, status), 120));
+                QApplication::processEvents();
+            })) {
+        dlProgress.close();
+        logToFile(QStringLiteral("[%1] 下载失败: %2").arg(appName, err));
+        return;
+    }
+    dlProgress.setValue(100);
+    dlProgress.close();
+
+    // 添加到配置
+    AppConfig newApp;
+    newApp.id = appId;
+    newApp.name = appName;
+    newApp.exeRelativePath = exeRel;
+    {
+        QUrl baseUrl(m_service.serverBaseUrl().trimmed());
+        QString path = baseUrl.path();
+        if (!path.endsWith('/')) {
+            path += '/';
+        }
+        path += QStringLiteral("updates/") + appId + QStringLiteral(".json");
+        baseUrl.setPath(path);
+        newApp.updateMetaUrl = baseUrl;
+    }
+
+    m_service.addAppEntry(newApp);
+    m_appById.insert(newApp.id, newApp);
+    m_remoteCatalog.remove(appId);
+
+    if (m_service.saveConfig(err)) {
+        logToFile(QStringLiteral("已下载并添加应用: %1").arg(appName));
+    } else {
+        logToFile(QStringLiteral("保存配置失败: %1").arg(err));
+    }
+
+    // 下载完成后立即进行依赖文件检测
+    QProgressDialog checkProgress(QStringLiteral("[%1] 正在检测依赖信息...").arg(appName), QString(), 0, 0, this);
+    checkProgress.setWindowModality(Qt::NonModal);
+    checkProgress.setCancelButton(nullptr);
+    checkProgress.setAutoClose(true);
+    checkProgress.setAutoReset(true);
+    checkProgress.show();
+    QApplication::processEvents();
+
+    OnlineAppInfo online = m_service.checkOnlineInfo(newApp);
+    checkProgress.close();
+
+    if (online.requestSuccess && !online.requiredFiles.isEmpty()) {
+        logToFile(QStringLiteral("[%1] 正在检测依赖文件完整性...").arg(appName));
+        QProgressDialog depProgress(QStringLiteral("[%1] 正在修复依赖...").arg(appName), QString(), 0, 100, this);
+        depProgress.setWindowModality(Qt::NonModal);
+        depProgress.setCancelButton(nullptr);
+        depProgress.setAutoClose(true);
+        depProgress.setAutoReset(true);
+        depProgress.setValue(0);
+        depProgress.show();
+        QApplication::processEvents();
+
+        QString depResult;
+        if (!m_service.checkAndFixDependencies(
+                newApp,
+                online,
+                depResult,
+                180000,
+                [&](qint64 received, qint64 total) {
+                    if (total > 0) {
+                        const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
+                        depProgress.setValue((p * 40) / 100);
+                    }
+                    QApplication::processEvents();
+                },
+                [&](const QString &status) {
+                    depProgress.setLabelText(compactStatusText(QStringLiteral("[%1] %2").arg(appName, status), 120));
+                    QApplication::processEvents();
+                },
+                [&](int installPct) {
+                    depProgress.setValue(40 + (qBound(0, installPct, 100) * 60) / 100);
+                    QApplication::processEvents();
+                })) {
+            depProgress.close();
+            const QString failMsg = depResult.trimmed().isEmpty()
+                                        ? QStringLiteral("依赖修复失败")
+                                        : QStringLiteral("依赖修复失败: %1").arg(depResult.trimmed());
+            logToFile(QStringLiteral("[%1] %2").arg(appName, failMsg));
+        } else {
+            depProgress.setValue(100);
+            depProgress.close();
+            const QString okMsg = depResult.trimmed().isEmpty()
+                                      ? QStringLiteral("依赖文件完整性检查通过")
+                                      : depResult.trimmed();
+            logToFile(QStringLiteral("[%1] %2").arg(appName, okMsg));
+        }
+    }
+
+    refreshAppIcons();
+}
+
+QIcon MainWindow::createDownloadIcon(int size) const
+{
+    QPixmap pixmap(size, size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    // 圆形背景
+    const qreal margin = size * 0.06;
+    QRectF bgRect(margin, margin, size - margin * 2, size - margin * 2);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(219, 234, 254)); // #dbeafe
+    painter.drawEllipse(bgRect);
+
+    const qreal cx = size / 2.0;
+    const qreal cy = size / 2.0;
+
+    // 下载箭头
+    QPen pen(QColor(37, 99, 235), size * 0.04, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    painter.setPen(pen);
+
+    const qreal arrowTop = cy - size * 0.22;
+    const qreal arrowBot = cy + size * 0.08;
+    const qreal wingLen  = size * 0.12;
+
+    // 竖线
+    painter.drawLine(QPointF(cx, arrowTop), QPointF(cx, arrowBot));
+    // 箭头两翼
+    painter.drawLine(QPointF(cx, arrowBot), QPointF(cx - wingLen, arrowBot - wingLen));
+    painter.drawLine(QPointF(cx, arrowBot), QPointF(cx + wingLen, arrowBot - wingLen));
+
+    // 底部托盘
+    const qreal trayLeft  = cx - size * 0.20;
+    const qreal trayRight = cx + size * 0.20;
+    const qreal trayTop   = cy + size * 0.16;
+    const qreal trayBot   = cy + size * 0.24;
+
+    QPainterPath tray;
+    tray.moveTo(trayLeft,  trayTop);
+    tray.lineTo(trayLeft,  trayBot);
+    tray.lineTo(trayRight, trayBot);
+    tray.lineTo(trayRight, trayTop);
+    painter.drawPath(tray);
+
+    painter.end();
+    return QIcon(pixmap);
 }

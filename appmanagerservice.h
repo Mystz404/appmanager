@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QObject>
@@ -73,6 +74,35 @@ public:
                                  const StatusCallback &statusCallback = StatusCallback(),
                                  const InstallProgressCallback &installProgressCallback = InstallProgressCallback());
 
+    /// 获取服务器基础 URL
+    QString serverBaseUrl() const;
+
+    /// 尝试连接服务器
+    bool tryConnectServer(int timeoutMs = 3000);
+
+    /// 从服务器获取应用清单
+    QJsonArray fetchAppCatalog(int timeoutMs = 10000);
+
+    /// 获取某个应用的历史版本列表
+    QJsonObject fetchHistoryVersions(const QString &appId, int timeoutMs = 10000);
+
+    /// 下载文件到指定路径
+    bool downloadToFile(const QUrl &url,
+                        const QString &filePath,
+                        QString &errorMessage,
+                        int timeoutMs = 30000,
+                        const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                        const StatusCallback &statusCallback = StatusCallback());
+
+    /// 添加应用条目
+    void addAppEntry(const AppConfig &app);
+
+    /// 移除应用条目
+    bool removeAppEntry(const QString &appId);
+
+    /// 保存配置到文件
+    bool saveConfig(QString &errorMessage);
+
 private:
     QByteArray httpGet(const QUrl &url,
                        QString &errorMessage,
@@ -100,7 +130,10 @@ private:
                              const InstallProgressCallback &installProgressCallback) const;
 
 private:
+    QString m_configPath;
+    QString m_appsRootRaw;
     QString m_appsRoot;
+    QString m_serverBaseUrl;
     QVector<AppConfig> m_apps;
 
     // QNAM 复用连接池，提升多个应用检查/下载时的效率。

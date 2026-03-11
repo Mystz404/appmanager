@@ -75,7 +75,7 @@ struct AppConfig
  *   "downloadUrl": "https://server/app.exe",
  *   "sha256": "...",
  *   "packageType": "exe",
- *   "installRelativeDir": "managed_apps/AppA"
+ *   "subDir": "MyApp"
  * }
  */
 struct OnlineAppInfo
@@ -130,25 +130,13 @@ struct OnlineAppInfo
      */
     QString packageType = QStringLiteral("exe");
 
-    // 当 packageType=zip 时生效，表示解压覆盖的目标目录（相对 appsRoot）。
-    // 若为空则默认覆盖到 exe 所在目录。
     /**
-     * @brief ZIP 解压目标目录（相对 appsRoot，可选）。
+     * @brief 客户端安装子目录（相对 appsRoot）。
      *
-     * - 仅在 packageType=zip 时有效；
-     * - 为空时默认使用 exe 所在目录；
-     * - 用于“程序与资源分离”场景下指定统一安装目录。
+     * - 服务端配置，告诉客户端应用应安装到哪个子目录；
+     * - 为空表示安装到 appsRoot 根目录。
      */
-    QString installRelativeDir;
-
-    /**
-     * @brief 安装模式。
-     *
-     * - 取值："single" 或 "allApps"；
-     * - single：仅安装当前 appId 对应应用；
-     * - allApps：ZIP 解压后按客户端 apps.json 中所有应用的 exe 路径逐一替换。
-     */
-    QString installMode = QStringLiteral("single");
+    QString subDir;
 
     /**
      * @brief ZIP 升级时是否递归替换目标目录下所有 EXE。

@@ -33,14 +33,24 @@ private:
     void logToFile(const QString &message);
     void appendLog(const QString &message);
     void loadConfig();
+    void validateLocalApps();
     void refreshAppIcons();
     bool launchAppById(const QString &appId);
+    void startUpdateWorkflow(const QVector<AppConfig> &apps);
     QString logFilePath() const;
+    void checkServerConnection();
+    void fetchRemoteCatalog();
+    QIcon createDownloadIcon(int size) const;
+    bool eventFilter(QObject *obj, QEvent *event) override;
+    void showAppContextMenu(const QString &appId, const QPoint &globalPos);
 
 private slots:
-    void onCheckRequiredFiles();
     void onCheckUpdates();
     void onAppIconClicked(QListWidgetItem *item);
+    void onOpenAppLocation(const QString &appId);
+    void onDeleteApp(const QString &appId);
+    void onDownloadHistoryVersion(const QString &appId);
+    void onDownloadRemoteApp(const QString &appId);
 
 private:
     Ui::MainWindow *ui;
@@ -50,12 +60,16 @@ private:
 
     QLabel *m_titleLabel = nullptr;
     QListWidget *m_appList = nullptr;
-    QPushButton *m_checkRequiredButton = nullptr;
     QPushButton *m_checkUpdatesButton = nullptr;
 
     QPlainTextEdit *m_logView = nullptr;
 
+    bool m_serverConnected = false;
+
     QHash<QString, OnlineAppInfo> m_onlineCache;
     QHash<QString, AppConfig> m_appById;
+
+    // 服务器清单中本地不存在的应用
+    QHash<QString, QJsonObject> m_remoteCatalog;
 };
 #endif // MAINWINDOW_H

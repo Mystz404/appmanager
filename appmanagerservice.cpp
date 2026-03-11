@@ -194,39 +194,59 @@ bool replaceExeFilesRecursively(const QString &sourceRoot,
     return true;
 }
 
-bool replaceSingleExeWithBackup(const QString &srcExePath,
-                                const QString &dstExePath,
-                                QString &errorMessage)
+QString requiredFileAbsolutePath(const QString &appInstallDir, const QString &relativeOrAbsolutePath)
 {
-    const QFileInfo dstInfo(dstExePath);
-    QDir().mkpath(dstInfo.absolutePath());
+    const QString cleaned = QDir::cleanPath(relativeOrAbsolutePath);
+    const QFileInfo info(cleaned);
+    if (info.isAbsolute()) {
+        return cleaned;
+    }
+    return QDir(appInstallDir).absoluteFilePath(cleaned);
+}
 
-    const QString backupPath = dstExePath + QStringLiteral(".bak");
-    const bool dstExists = QFileInfo::exists(dstExePath);
-
-    QFile::remove(backupPath);
-    if (dstExists && !QFile::copy(dstExePath, backupPath)) {
-        errorMessage = QStringLiteral("备份 EXE 失败: %1")
-                           .arg(QDir::toNativeSeparators(dstExePath));
-        return false;
+QUrl rebaseToConfiguredServer(const QString &rawUrlText,
+                              const QUrl &rawUrl,
+                              const QString &serverBaseUrl)
+{
+    const QUrl base(serverBaseUrl.trimmed());
+    if (!base.isValid() || base.host().isEmpty()) {
+        return rawUrl;
     }
 
-    if (dstExists && !QFile::remove(dstExePath)) {
-        errorMessage = QStringLiteral("替换 EXE 失败，目标文件可能被占用: %1")
-                           .arg(QDir::toNativeSeparators(dstExePath));
-        return false;
-    }
+    const QString text = rawUrlText.trimmed();
 
-    if (!QFile::copy(srcExePath, dstExePath)) {
-        if (QFileInfo::exists(backupPath)) {
-            QFile::copy(backupPath, dstExePath);
+    // 相对 URL 或无 host 的 URL，按配置服务器地址解析。
+    if (rawUrl.isEmpty() || rawUrl.isRelative() || rawUrl.host().isEmpty()) {
+        if (text.isEmpty()) {
+            return rawUrl;
         }
-        errorMessage = QStringLiteral("写入新 EXE 失败: %1")
-                           .arg(QDir::toNativeSeparators(dstExePath));
-        return false;
+        const QUrl rel(text);
+        return base.resolved(rel);
     }
 
-    return true;
+    // 绝对 URL：保留 path/query，仅替换为 apps.json 配置的主机与端口。
+    QUrl rebased = rawUrl;
+    rebased.setScheme(base.scheme());
+    rebased.setHost(base.host());
+    rebased.setPort(base.port(-1));
+    return rebased;
+}
+
+QUrl buildUpdateMetaUrlByAppId(const QString &serverBaseUrl, const QString &appId)
+{
+    const QUrl base(serverBaseUrl.trimmed());
+    if (!base.isValid() || base.host().isEmpty() || appId.trimmed().isEmpty()) {
+        return {};
+    }
+
+    QUrl url = base;
+    QString path = url.path();
+    if (!path.endsWith('/')) {
+        path += '/';
+    }
+    path += QStringLiteral("updates/") + appId.trimmed() + QStringLiteral(".json");
+    url.setPath(path);
+    return url;
 }
 
 }
@@ -238,6 +258,7 @@ AppManagerService::AppManagerService(QObject *parent)
 
 bool AppManagerService::loadConfig(const QString &configPath, QString &errorMessage)
 {
+    m_configPath = configPath;
     QFile file(configPath);
     if (!file.open(QIODevice::ReadOnly)) {
         errorMessage = QStringLiteral("无法打开配置文件: %1").arg(configPath);
@@ -255,7 +276,16 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
     }
 
     const QJsonObject root = doc.object();
-    const QString rootFromConfig = root.value(QStringLiteral("appsRoot")).toString().trimmed();
+    m_appsRootRaw = root.value(QStringLiteral("appsRoot")).toString().trimmed();
+    m_serverBaseUrl = root.value(QStringLiteral("serverBaseUrl")).toString().trimmed();
+
+    const QUrl baseServerUrl(m_serverBaseUrl);
+    if (m_serverBaseUrl.isEmpty() || !baseServerUrl.isValid() || baseServerUrl.host().isEmpty()) {
+        errorMessage = QStringLiteral("serverBaseUrl 未配置或格式无效，请在 apps.json 中配置有效服务器地址");
+        return false;
+    }
+
+    const QString rootFromConfig = m_appsRootRaw;
     if (rootFromConfig.isEmpty()) {
         // 未设置 appsRoot 时，默认使用配置文件所在目录，便于示例和落地。
         m_appsRoot = QFileInfo(configPath).absolutePath();
@@ -286,7 +316,6 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
         app.id = obj.value(QStringLiteral("id")).toString().trimmed();
         app.name = obj.value(QStringLiteral("name")).toString().trimmed();
         app.exeRelativePath = obj.value(QStringLiteral("exe")).toString().trimmed();
-        app.updateMetaUrl = QUrl(obj.value(QStringLiteral("updateMetaUrl")).toString().trimmed());
 
         const QJsonArray reqArray = obj.value(QStringLiteral("requiredFiles")).toArray();
         for (const QJsonValue &value : reqArray) {
@@ -296,9 +325,8 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
             }
         }
 
-        if (app.id.isEmpty() || app.name.isEmpty() || app.exeRelativePath.isEmpty()
-            || !app.updateMetaUrl.isValid()) {
-            errorMessage = QStringLiteral("第 %1 个应用配置不完整或 updateMetaUrl 无效").arg(i + 1);
+        if (app.id.isEmpty() || app.name.isEmpty() || app.exeRelativePath.isEmpty()) {
+            errorMessage = QStringLiteral("第 %1 个应用配置不完整").arg(i + 1);
             return false;
         }
 
@@ -306,6 +334,17 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
     }
 
     m_apps = parsedApps;
+
+    // 统一使用 serverBaseUrl 生成 updateMetaUrl。
+    for (AppConfig &app : m_apps) {
+        const QUrl generated = buildUpdateMetaUrlByAppId(m_serverBaseUrl, app.id);
+        if (!generated.isValid() || generated.isEmpty()) {
+            errorMessage = QStringLiteral("无法根据 serverBaseUrl 生成应用元数据地址: %1").arg(app.id);
+            return false;
+        }
+        app.updateMetaUrl = generated;
+    }
+
     return true;
 }
 
@@ -355,8 +394,9 @@ bool AppManagerService::checkRequiredFiles(const AppConfig &app, QStringList &mi
         missingFiles.push_back(app.exeRelativePath);
     }
 
+    const QString appInstallDir = appAbsoluteDir(app);
     for (const QString &relativeFile : app.requiredRelativeFiles) {
-        if (!QFileInfo::exists(resolvePath(relativeFile))) {
+        if (!QFileInfo::exists(requiredFileAbsolutePath(appInstallDir, relativeFile))) {
             missingFiles.push_back(relativeFile);
         }
     }
@@ -443,12 +483,13 @@ OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app, int timeo
 
     const QJsonObject obj = doc.object();
     info.latestVersion = obj.value(QStringLiteral("latestVersion")).toString().trimmed();
-    info.downloadUrl = QUrl(obj.value(QStringLiteral("downloadUrl")).toString().trimmed());
+    const QString downloadUrlText = obj.value(QStringLiteral("downloadUrl")).toString().trimmed();
+    info.downloadUrl = rebaseToConfiguredServer(downloadUrlText,
+                                                QUrl(downloadUrlText),
+                                                m_serverBaseUrl);
     info.sha256 = obj.value(QStringLiteral("sha256")).toString().trimmed().toLower();
     info.packageType = obj.value(QStringLiteral("packageType")).toString().trimmed().toLower();
-    info.installRelativeDir = obj.value(QStringLiteral("installRelativeDir")).toString().trimmed();
-    const QString installModeText = obj.value(QStringLiteral("installMode")).toString().trimmed();
-    info.installMode = installModeText.isEmpty() ? QStringLiteral("single") : installModeText;
+    info.subDir = obj.value(QStringLiteral("subDir")).toString().trimmed();
     if (obj.contains(QStringLiteral("zipReplaceExeRecursively"))) {
         info.zipReplaceExeRecursively = obj.value(QStringLiteral("zipReplaceExeRecursively")).toBool(true);
     }
@@ -462,7 +503,9 @@ OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app, int timeo
     // 解析完整包下载地址
     const QString fullPkgStr = obj.value(QStringLiteral("fullPackageUrl")).toString().trimmed();
     if (!fullPkgStr.isEmpty()) {
-        info.fullPackageUrl = QUrl(fullPkgStr);
+        info.fullPackageUrl = rebaseToConfiguredServer(fullPkgStr,
+                                                       QUrl(fullPkgStr),
+                                                       m_serverBaseUrl);
     }
 
     if (info.packageType.isEmpty()) {
@@ -478,13 +521,6 @@ OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app, int timeo
     if (info.packageType != QStringLiteral("exe") && info.packageType != QStringLiteral("zip")) {
         info.requestSuccess = false;
         info.errorMessage = QStringLiteral("packageType 仅支持 exe 或 zip");
-        return info;
-    }
-
-    if (info.installMode != QStringLiteral("single")
-        && info.installMode != QStringLiteral("allApps")) {
-        info.requestSuccess = false;
-        info.errorMessage = QStringLiteral("installMode 仅支持 single 或 allApps");
         return info;
     }
 
@@ -557,10 +593,11 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
         return true;
     }
 
-    // 检查每个依赖文件是否存在
+    // 检查每个依赖文件是否存在（相对应用安装目录）
+    const QString appInstallDir = appAbsoluteDir(app);
     QStringList missingFiles;
     for (const QString &relFile : online.requiredFiles) {
-        const QString absPath = resolvePath(relFile);
+        const QString absPath = requiredFileAbsolutePath(appInstallDir, relFile);
         if (!QFileInfo::exists(absPath)) {
             missingFiles.append(relFile);
         }
@@ -618,15 +655,10 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
         installProgressCallback(10);
     }
 
-    // 确定解压目标目录
-    QString targetDir;
-    if (online.installMode == QStringLiteral("allApps")) {
-        targetDir = appsRoot();
-    } else if (online.installRelativeDir.trimmed().isEmpty()) {
-        targetDir = appAbsoluteDir(app);
-    } else {
-        targetDir = resolvePath(online.installRelativeDir);
-    }
+    // 确定解压目标目录：优先使用服务端配置的安装子目录
+    QString targetDir = online.subDir.isEmpty()
+                          ? appAbsoluteDir(app)
+                          : resolvePath(online.subDir);
     QDir().mkpath(targetDir);
 
     // 解压完整包到目标目录
@@ -752,7 +784,7 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
     // 再次校验依赖文件
     QStringList stillMissing;
     for (const QString &relFile : online.requiredFiles) {
-        if (!QFileInfo::exists(resolvePath(relFile))) {
+        if (!QFileInfo::exists(requiredFileAbsolutePath(appInstallDir, relFile))) {
             stillMissing.append(relFile);
         }
     }
@@ -863,8 +895,7 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
 
     if (online.packageType == QStringLiteral("zip")) {
         if (statusCallback) {
-            statusCallback(QStringLiteral("开始执行 ZIP 解压安装，模式: %1")
-                               .arg(online.installMode));
+            statusCallback(QStringLiteral("开始执行 ZIP 解压安装..."));
         }
         return upgradeByZipExtract(app,
                                    online,
@@ -1000,14 +1031,10 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
         return false;
     }
 
-    QString targetDir;
-    if (online.installMode == QStringLiteral("allApps")) {
-        targetDir = appsRoot();
-    } else if (online.installRelativeDir.trimmed().isEmpty()) {
-        targetDir = appAbsoluteDir(app);
-    } else {
-        targetDir = resolvePath(online.installRelativeDir);
-    }
+    // 目标目录：优先使用服务端配置的安装子目录
+    QString targetDir = online.subDir.isEmpty()
+                          ? appAbsoluteDir(app)
+                          : resolvePath(online.subDir);
     QDir().mkpath(targetDir);
 
     const QString extractedDir = QDir(tempDir.path()).absoluteFilePath(QStringLiteral("unzipped"));
@@ -1244,52 +1271,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
     }
 
     int replacedExeCount = 0;
-    if (online.installMode == QStringLiteral("allApps")) {
-        if (statusCallback) {
-            statusCallback(QStringLiteral("全量模式：开始替换 apps.json 标识的全部应用 EXE..."));
-        }
-        QStringList missingExeApps;
-        for (int i = 0; i < m_apps.size(); ++i) {
-            const AppConfig &cfg = m_apps.at(i);
-            const QString srcExePath = QDir(extractedDir).absoluteFilePath(cfg.exeRelativePath);
-            const QString dstExePath = resolvePath(cfg.exeRelativePath);
-
-            if (!QFileInfo::exists(srcExePath)) {
-                missingExeApps << QStringLiteral("%1(%2)").arg(cfg.name, cfg.exeRelativePath);
-                if (statusCallback) {
-                    statusCallback(QStringLiteral("缺失 EXE，无法替换: %1")
-                                       .arg(QDir::toNativeSeparators(srcExePath)));
-                }
-                continue;
-            }
-
-            if (statusCallback) {
-                statusCallback(QStringLiteral("替换应用 EXE [%1/%2]: %3")
-                                   .arg(i + 1)
-                                   .arg(m_apps.size())
-                                   .arg(cfg.name));
-            }
-
-            QString replaceError;
-            if (!replaceSingleExeWithBackup(srcExePath, dstExePath, replaceError)) {
-                resultMessage = QStringLiteral("ZIP 升级失败（全量 EXE 替换阶段）: %1").arg(replaceError);
-                if (statusCallback) {
-                    statusCallback(resultMessage);
-                }
-                return false;
-            }
-            ++replacedExeCount;
-        }
-
-        if (!missingExeApps.isEmpty()) {
-            resultMessage = QStringLiteral("ZIP 升级失败：压缩包缺少以下应用 EXE：%1")
-                                .arg(missingExeApps.join(QStringLiteral("，")));
-            if (statusCallback) {
-                statusCallback(resultMessage);
-            }
-            return false;
-        }
-    } else if (online.zipReplaceExeRecursively) {
+    if (online.zipReplaceExeRecursively) {
         if (statusCallback) {
             statusCallback(QStringLiteral("正在递归替换 EXE 文件..."));
         }
@@ -1313,11 +1295,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
         installProgressCallback(95);
     }
 
-    if (online.installMode == QStringLiteral("allApps")) {
-        resultMessage = QStringLiteral("ZIP 全量升级成功，已覆盖目录: %1，替换应用 EXE 数量: %2")
-                            .arg(QDir::toNativeSeparators(targetDir))
-                            .arg(replacedExeCount);
-    } else if (online.zipReplaceExeRecursively) {
+    if (online.zipReplaceExeRecursively) {
         resultMessage = QStringLiteral("ZIP 升级成功，已覆盖目录: %1，递归替换 EXE 数量: %2")
                             .arg(QDir::toNativeSeparators(targetDir))
                             .arg(replacedExeCount);
@@ -1484,6 +1462,16 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
             continue;
         }
 
+        // HTTP 416: Range Not Satisfiable —— .part 文件比服务器文件大（文件已更新），从头重下
+        if (httpStatus == 416) {
+            if (statusCallback) {
+                statusCallback(QStringLiteral("服务端返回 416（Range 无效），删除断点文件后重新全量下载"));
+            }
+            QFile::remove(partPath);
+            downloadedBytes = 0;
+            continue;
+        }
+
         if (timeout || netError != QNetworkReply::NoError) {
             if (attempt < maxRetry && downloadedBytes > 0) {
                 if (statusCallback) {
@@ -1541,4 +1529,202 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
 
     errorMessage = QStringLiteral("下载失败：已超过最大重试次数");
     return false;
+}
+
+// ============================================================================
+//  服务器连接 & 清单 & 历史版本
+// ============================================================================
+
+QString AppManagerService::serverBaseUrl() const
+{
+    return m_serverBaseUrl;
+}
+
+bool AppManagerService::tryConnectServer(int timeoutMs)
+{
+    if (m_serverBaseUrl.isEmpty()) {
+        return false;
+    }
+
+    QString errorMessage;
+    QByteArray response = httpGet(QUrl(m_serverBaseUrl + QStringLiteral("/")),
+                                  errorMessage, timeoutMs);
+    return errorMessage.isEmpty();
+}
+
+QJsonArray AppManagerService::fetchAppCatalog(int timeoutMs)
+{
+    if (m_serverBaseUrl.isEmpty()) {
+        return {};
+    }
+
+    QString errorMessage;
+    QByteArray response = httpGet(QUrl(m_serverBaseUrl + QStringLiteral("/catalog")),
+                                  errorMessage, timeoutMs);
+    if (!errorMessage.isEmpty()) {
+        return {};
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(response, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
+        return {};
+    }
+
+    QJsonArray normalized;
+    const QJsonArray catalog = doc.array();
+    for (const QJsonValue &value : catalog) {
+        if (!value.isObject()) {
+            normalized.append(value);
+            continue;
+        }
+
+        QJsonObject item = value.toObject();
+
+        const QString downloadUrlText = item.value(QStringLiteral("downloadUrl")).toString().trimmed();
+        if (!downloadUrlText.isEmpty()) {
+            item.insert(QStringLiteral("downloadUrl"),
+                        rebaseToConfiguredServer(downloadUrlText,
+                                                 QUrl(downloadUrlText),
+                                                 m_serverBaseUrl)
+                            .toString());
+        }
+
+        const QString metaUrlText = item.value(QStringLiteral("updateMetaUrl")).toString().trimmed();
+        if (!metaUrlText.isEmpty()) {
+            item.insert(QStringLiteral("updateMetaUrl"),
+                        rebaseToConfiguredServer(metaUrlText,
+                                                 QUrl(metaUrlText),
+                                                 m_serverBaseUrl)
+                            .toString());
+        }
+
+        normalized.append(item);
+    }
+    return normalized;
+}
+
+QJsonObject AppManagerService::fetchHistoryVersions(const QString &appId, int timeoutMs)
+{
+    if (m_serverBaseUrl.isEmpty()) {
+        return {};
+    }
+
+    QString errorMessage;
+    QByteArray response = httpGet(QUrl(m_serverBaseUrl + QStringLiteral("/history/") + appId),
+                                  errorMessage, timeoutMs);
+    if (!errorMessage.isEmpty()) {
+        return {};
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(response, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return {};
+    }
+
+    QJsonObject result = doc.object();
+    const QJsonArray versions = result.value(QStringLiteral("versions")).toArray();
+    if (!versions.isEmpty()) {
+        QJsonArray normalizedVersions;
+        for (const QJsonValue &v : versions) {
+            if (!v.isObject()) {
+                normalizedVersions.append(v);
+                continue;
+            }
+            QJsonObject vo = v.toObject();
+            const QString dlText = vo.value(QStringLiteral("downloadUrl")).toString().trimmed();
+            if (!dlText.isEmpty()) {
+                vo.insert(QStringLiteral("downloadUrl"),
+                          rebaseToConfiguredServer(dlText,
+                                                   QUrl(dlText),
+                                                   m_serverBaseUrl)
+                              .toString());
+            }
+            normalizedVersions.append(vo);
+        }
+        result.insert(QStringLiteral("versions"), normalizedVersions);
+    }
+
+    return result;
+}
+
+bool AppManagerService::downloadToFile(const QUrl &url,
+                                       const QString &filePath,
+                                       QString &errorMessage,
+                                       int timeoutMs,
+                                       const DownloadProgressCallback &progressCallback,
+                                       const StatusCallback &statusCallback)
+{
+    return downloadFileWithResume(url,
+                                  filePath,
+                                  errorMessage,
+                                  timeoutMs,
+                                  progressCallback,
+                                  statusCallback);
+}
+
+// ============================================================================
+//  配置管理
+// ============================================================================
+
+void AppManagerService::addAppEntry(const AppConfig &app)
+{
+    m_apps.push_back(app);
+}
+
+bool AppManagerService::removeAppEntry(const QString &appId)
+{
+    for (int i = 0; i < m_apps.size(); ++i) {
+        if (m_apps[i].id == appId) {
+            m_apps.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AppManagerService::saveConfig(QString &errorMessage)
+{
+    if (m_configPath.isEmpty()) {
+        errorMessage = QStringLiteral("无配置文件路径");
+        return false;
+    }
+
+    QJsonObject root;
+    if (!m_appsRootRaw.isEmpty()) {
+        root.insert(QStringLiteral("appsRoot"), m_appsRootRaw);
+    }
+    if (!m_serverBaseUrl.isEmpty()) {
+        root.insert(QStringLiteral("serverBaseUrl"), m_serverBaseUrl);
+    }
+
+    QJsonArray appsArray;
+    for (const AppConfig &app : m_apps) {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("id"), app.id);
+        obj.insert(QStringLiteral("name"), app.name);
+        obj.insert(QStringLiteral("exe"), app.exeRelativePath);
+        if (app.updateMetaUrl.isValid() && !app.updateMetaUrl.isEmpty()) {
+            obj.insert(QStringLiteral("updateMetaUrl"), app.updateMetaUrl.toString());
+        }
+        if (!app.requiredRelativeFiles.isEmpty()) {
+            QJsonArray reqArr;
+            for (const QString &f : app.requiredRelativeFiles) {
+                reqArr.append(f);
+            }
+            obj.insert(QStringLiteral("requiredFiles"), reqArr);
+        }
+        appsArray.append(obj);
+    }
+    root.insert(QStringLiteral("apps"), appsArray);
+
+    QFile file(m_configPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        errorMessage = QStringLiteral("无法写入配置文件: %1").arg(m_configPath);
+        return false;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    file.close();
+    return true;
 }
