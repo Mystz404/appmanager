@@ -1,0 +1,9 @@
+﻿{
+  "latestVersion": "2.0.0",
+  "downloadUrl": "http://your-server-ip:port/releases/AppManagerSetup_2.0.0.exe",
+  "releaseNotes": "版本 2.0.0 更新说明\n\n新增功能:\n- 支持应用自身升级\n- 改进进度对话框\n- 优化网络连接\n\n修复:\n- 修复进程识别问题\n- 修复级联删除问题\n- 改进版本比较算法",
+  "minSupportedVersion": "1.0.0",
+  "forceUpdate": false,
+  "sha256": "",
+  "changelogUrl": "http://your-server-ip:port/docs/CHANGELOG.md"
+}

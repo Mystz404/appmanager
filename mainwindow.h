@@ -39,6 +39,8 @@ private:
     void startUpdateWorkflow(const QVector<AppConfig> &apps);
     QString logFilePath() const;
     void checkServerConnection();
+    void trySilentAppManagerAutoUpdate();
+    void tryStartupAppsUpdateCheck();
     void fetchRemoteCatalog();
     QIcon createDownloadIcon(int size) const;
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -51,6 +53,8 @@ private slots:
     void onDeleteApp(const QString &appId);
     void onDownloadHistoryVersion(const QString &appId);
     void onDownloadRemoteApp(const QString &appId);
+    void onCheckAppManagerUpdate();
+    void onAboutAppManager();
 
 private:
     Ui::MainWindow *ui;
@@ -65,6 +69,9 @@ private:
     QPlainTextEdit *m_logView = nullptr;
 
     bool m_serverConnected = false;
+    bool m_startupAutoUpdateChecked = false;
+    bool m_startupAutoUpdateRunning = false;
+    bool m_startupAppsUpdateCheckScheduled = false;
 
     QHash<QString, OnlineAppInfo> m_onlineCache;
     QHash<QString, AppConfig> m_appById;

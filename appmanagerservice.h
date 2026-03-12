@@ -103,6 +103,24 @@ public:
     /// 保存配置到文件
     bool saveConfig(QString &errorMessage);
 
+    // ==================== AppManager 自身升级支持 ====================
+
+    /// 获取AppManager应用名称
+    QString appManagerName() const { return QStringLiteral("AppManager"); }
+
+    /// 获取AppManager当前版本
+    QString appManagerVersion() const;
+
+    /// 检查AppManager是否有新版本
+    OnlineAppInfo checkAppManagerUpdate(int timeoutMs = 10000);
+
+    /// 升级AppManager（下载安装程序并启动）
+    bool upgradeAppManager(const OnlineAppInfo &online,
+                          QString &resultMessage,
+                          int timeoutMs = 30000,
+                          const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                          const StatusCallback &statusCallback = StatusCallback());
+
 private:
     QByteArray httpGet(const QUrl &url,
                        QString &errorMessage,

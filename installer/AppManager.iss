@@ -1,38 +1,91 @@
-﻿#define MyAppName "AppManager"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "YourCompany"
+﻿; ============================
+; 预处理宏（可复用常量）
+; ============================
+; 应用显示名称（安装向导、开始菜单、卸载信息中会显示）
+#define MyAppName "AppManager"
+; 应用版本号（用于安装包版本与升级判断）
+#define MyAppVersion "1.0.3.0"
+
+; 发布者名称（控制面板卸载列表中的发布者）
+#define MyAppPublisher "Kgooer"
+; 主程序 EXE 文件名（安装后用于创建快捷方式与卸载图标）
 #define MyAppExeName "AppManager.exe"
-#define MySourceDir "D:\\WorkSpace\\QtProjects\\AppManager\\dist\\AppManager"
+; 打包源目录（应为 windeployqt 后的完整可运行目录）
+#define MySourceDir "D:\WorkSpace\QtProjects\AppManager\build\Desktop_Qt_5_15_2_MinGW_32_bit-Release\AppManager"
+; 安装包输出目录（ISCC 编译后 exe 的保存位置）
 #define MyOutputDir "D:\\WorkSpace\\QtProjects\\AppManager\\installer_output"
 
 [Setup]
+; 应用唯一 ID（GUID），用于标识同一个产品；已发布后不要随意改
 AppId={{6E4F8F98-2DB5-4D92-9E3A-1D6F8F0B1C20}
+; 应用名称（引用上面的宏）
 AppName={#MyAppName}
+; 应用版本（引用上面的宏）
 AppVersion={#MyAppVersion}
+; 安装包 EXE 的文件版本（Windows 版本资源）
+VersionInfoVersion={#MyAppVersion}
+; 安装包 EXE 的产品版本（Windows 版本资源）
+VersionInfoProductVersion={#MyAppVersion}
+; 发布者（引用上面的宏）
 AppPublisher={#MyAppPublisher}
+; 默认安装目录（autopf=Program Files）
 DefaultDirName={autopf}\{#MyAppName}
+; 开始菜单程序组名称
 DefaultGroupName={#MyAppName}
+; 输出目录（生成安装包的位置）
 OutputDir={#MyOutputDir}
-OutputBaseFilename=AppManagerSetup
+; 输出安装包文件名（不含 .exe 后缀）
+OutputBaseFilename=AppManagerSetup_{#MyAppVersion}
+; 压缩算法（lzma 压缩率高）
 Compression=lzma
+; 固实压缩（体积更小，但安装时随机访问性能略差）
 SolidCompression=yes
+; 安装向导界面风格（modern 为现代样式）
 WizardStyle=modern
+; 在 64 位系统上默认安装到 64 位目录（x64compatible 适配 x64）
 ArchitecturesInstallIn64BitMode=x64compatible
+; 安装所需权限（admin 表示需要管理员权限）
 PrivilegesRequired=admin
+; 卸载条目显示图标（控制面板中展示的图标路径）
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
+; 安装界面语言（简体中文）
+Name: "chinesesimplified"; MessagesFile: "compiler:chinesesimplified.isl"
 
 [Tasks]
+; 可选任务：创建桌面快捷方式
+; unchecked 表示默认不勾选
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
 
 [Files]
+; 将源目录下所有文件递归复制到安装目录
+; recursesubdirs: 递归子目录
+; ignoreversion: 忽略文件版本比较，按规则直接复制
 Source: "{#MySourceDir}\\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
+; 开始菜单快捷方式
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+; 桌面快捷方式（仅当用户勾选 desktopicon 任务时创建）
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+; 安装完成后运行主程序
+; nowait: 不等待程序退出
+; postinstall: 仅在安装向导最后一步显示
+; skipifsilent: 静默安装时跳过自动启动
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+
+
+
+
+
+
+
+
+
+
+
+

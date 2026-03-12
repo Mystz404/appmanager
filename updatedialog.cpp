@@ -16,6 +16,25 @@
 #include <QProcess>
 #include <QVBoxLayout>
 
+namespace {
+constexpr int kUnifiedProgressBarWidth = 420;
+constexpr int kUnifiedProgressBarHeight = 18;
+
+void applyUnifiedProgressBarStyle(QProgressBar *bar)
+{
+    if (bar == nullptr) {
+        return;
+    }
+
+    bar->setMinimumWidth(kUnifiedProgressBarWidth);
+    bar->setMaximumWidth(kUnifiedProgressBarWidth);
+    bar->setMinimumHeight(kUnifiedProgressBarHeight);
+    bar->setStyleSheet(QStringLiteral(
+        "QProgressBar { border: 1px solid #cbd5e1; border-radius: 5px; background: #ffffff; text-align: center; }"
+        "QProgressBar::chunk { background: #2563eb; border-radius: 4px; }"));
+}
+}
+
 #ifdef Q_OS_WIN
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -93,6 +112,7 @@ QWidget *UpdateDialog::createCheckPage()
     m_checkProgress->setRange(0, qMax(m_apps.size(), 1));
     m_checkProgress->setValue(0);
     m_checkProgress->setTextVisible(true);
+    applyUnifiedProgressBarStyle(m_checkProgress);
     ly->addWidget(m_checkProgress);
 
     ly->addStretch();
@@ -199,6 +219,7 @@ QWidget *UpdateDialog::createUpgradePage()
     m_upgradeProgress->setRange(0, 100);
     m_upgradeProgress->setValue(0);
     m_upgradeProgress->setTextVisible(true);
+    applyUnifiedProgressBarStyle(m_upgradeProgress);
     ly->addWidget(m_upgradeProgress);
 
     ly->addStretch();

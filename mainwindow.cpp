@@ -25,6 +25,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMenu>
+#include <QMenuBar>
+#include <QAction>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
@@ -32,7 +34,41 @@
 #include <QProgressDialog>
 #include <QAbstractItemView>
 #include <QStyledItemDelegate>
+#include <QSettings>
 #include <QTimer>
+
+namespace {
+constexpr int kProgressDialogWidth = 540;
+constexpr int kProgressBarWidth = 420;
+constexpr int kProgressBarHeight = 18;
+constexpr qint64 kStartupAppCheckCooldownSec = 16 * 60 * 60; // 16 小时
+
+void setupUnifiedProgressDialog(QProgressDialog &dlg, const QString &labelText, bool indeterminate)
+{
+    dlg.setLabelText(labelText);
+    dlg.setWindowModality(Qt::NonModal);
+    dlg.setCancelButton(nullptr);
+    dlg.setAutoClose(true);
+    dlg.setAutoReset(true);
+    dlg.setMinimumDuration(0);
+    dlg.setMinimumWidth(kProgressDialogWidth);
+    dlg.setStyleSheet(QStringLiteral(
+        "QProgressDialog { background: #f8fafc; }"
+        "QLabel { color: #1f2937; min-width: %1px; }"
+        "QProgressBar { min-width: %2px; max-width: %2px; min-height: %3px; border: 1px solid #cbd5e1; border-radius: 5px; background: #ffffff; text-align: center; }"
+        "QProgressBar::chunk { background: #2563eb; border-radius: 4px; }")
+            .arg(kProgressBarWidth)
+            .arg(kProgressBarWidth)
+            .arg(kProgressBarHeight));
+
+    if (indeterminate) {
+        dlg.setRange(0, 0);
+    } else {
+        dlg.setRange(0, 100);
+        dlg.setValue(0);
+    }
+}
+}
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
@@ -289,7 +325,7 @@ void MainWindow::setupUiWidgets()
     m_titleLabel->setObjectName(QStringLiteral("titleLabel"));
 
     auto *buttonLayout = new QHBoxLayout();
-    m_checkUpdatesButton = new QPushButton(QStringLiteral("在线检测更新"), root);
+    m_checkUpdatesButton = new QPushButton(QStringLiteral("检测应用更新"), root);
 
     buttonLayout->addWidget(m_checkUpdatesButton);
     buttonLayout->addStretch();
@@ -304,7 +340,7 @@ void MainWindow::setupUiWidgets()
     m_appList->setWordWrap(true);
     m_appList->setContextMenuPolicy(Qt::CustomContextMenu);
 
-    auto *hintLabel = new QLabel(QStringLiteral("点击图标启动应用 | 右键点击显示更多选项"), root);
+    auto *hintLabel = new QLabel(QStringLiteral("点击图标启动应用"), root);
     hintLabel->setObjectName(QStringLiteral("hintLabel"));
 
     // 日志面板
@@ -328,6 +364,20 @@ void MainWindow::setupUiWidgets()
     m_appList->setItemDelegate(new AppItemDelegate(m_appList));
     m_appList->setContextMenuPolicy(Qt::NoContextMenu);
     m_appList->viewport()->installEventFilter(this);
+
+    // ==================== 创建菜单栏 ====================
+    QMenuBar *menuBar = new QMenuBar(this);
+    this->setMenuBar(menuBar);
+
+    QMenu *helpMenu = menuBar->addMenu(QStringLiteral("帮助(&H)"));
+    QAction *checkUpdateAction = helpMenu->addAction(QStringLiteral("检查 AppManager 更新(&U)"));
+    checkUpdateAction->setToolTip(QStringLiteral("检查 AppManager 是否有新版本"));
+    connect(checkUpdateAction, &QAction::triggered, this, &MainWindow::onCheckAppManagerUpdate);
+
+    helpMenu->addSeparator();
+
+    QAction *aboutAction = helpMenu->addAction(QStringLiteral("关于 AppManager(&A)"));
+    connect(aboutAction, &QAction::triggered, this, &MainWindow::onAboutAppManager);
 }
 
 void MainWindow::connectSignals()
@@ -464,8 +514,14 @@ void MainWindow::refreshAppIcons()
     m_appList->clear();
     QFileIconProvider provider;
 
-    // 1) 本地已有的应用
+    // 1) 本地已有的应用（跳过 AppManager 本身）
     for (const AppConfig &app : apps) {
+        // 跳过 AppManager 自身，不在主页面显示
+        if (app.id.toLower() == QStringLiteral("appmanager")
+            || app.name.toLower() == QStringLiteral("appmanager")) {
+            continue;
+        }
+
         const QString exePath = m_service.appAbsoluteExePath(app);
         QIcon icon = provider.icon(QFileInfo(exePath));
         if (icon.isNull()) {
@@ -520,6 +576,13 @@ bool MainWindow::launchAppById(const QString &appId)
 {
     const AppConfig app = m_appById.value(appId);
     if (app.id.isEmpty()) {
+        return false;
+    }
+
+    // 不允许启动 AppManager 本身
+    if (app.id.toLower() == QStringLiteral("appmanager")
+        || app.name.toLower() == QStringLiteral("appmanager")) {
+        logToFile(QStringLiteral("[%1] 该应用不可从本启动台启动，请使用菜单中的更新功能").arg(app.name));
         return false;
     }
 
@@ -606,11 +669,23 @@ void MainWindow::startUpdateWorkflow(const QVector<AppConfig> &apps)
 
 void MainWindow::onCheckUpdates()
 {
-    const QVector<AppConfig> apps = m_service.apps();
-    if (apps.isEmpty()) {
+    QVector<AppConfig> apps = m_service.apps();
+    
+    // 排除 AppManager，只检查其他应用的更新
+    QVector<AppConfig> filteredApps;
+    for (const AppConfig &app : apps) {
+        if (app.id.toLower() != QStringLiteral("appmanager")
+            && app.name.toLower() != QStringLiteral("appmanager")) {
+            filteredApps.append(app);
+        }
+    }
+    
+    if (filteredApps.isEmpty()) {
+        logToFile(QStringLiteral("没有可更新的应用"));
         return;
     }
-    startUpdateWorkflow(apps);
+    
+    startUpdateWorkflow(filteredApps);
 }
 
 void MainWindow::onAppIconClicked(QListWidgetItem *item)
@@ -653,9 +728,185 @@ void MainWindow::checkServerConnection()
 
     // 连接成功后获取应用清单
     if (m_serverConnected) {
+        // 启动时静默检测 AppManager 自更新（仅执行一次）
+        if (!m_startupAutoUpdateChecked) {
+            QTimer::singleShot(0, this, &MainWindow::trySilentAppManagerAutoUpdate);
+        }
+        // 启动时低频检测其他应用更新（串行抽样，降低并发和请求量）
+        if (!m_startupAppsUpdateCheckScheduled) {
+            m_startupAppsUpdateCheckScheduled = true;
+            QTimer::singleShot(1200, this, &MainWindow::tryStartupAppsUpdateCheck);
+        }
         fetchRemoteCatalog();
         refreshAppIcons();
     }
+}
+
+void MainWindow::trySilentAppManagerAutoUpdate()
+{
+    if (m_startupAutoUpdateChecked || m_startupAutoUpdateRunning) {
+        return;
+    }
+    if (!m_serverConnected) {
+        return;
+    }
+
+    m_startupAutoUpdateChecked = true;
+    m_startupAutoUpdateRunning = true;
+
+    appendLog(QStringLiteral("启动时静默检测 AppManager 更新..."));
+
+    const OnlineAppInfo online = m_service.checkAppManagerUpdate();
+    if (!online.requestSuccess) {
+        appendLog(QStringLiteral("启动静默检测失败: %1").arg(online.errorMessage));
+        m_startupAutoUpdateRunning = false;
+        return;
+    }
+
+    const QString currentVersion = m_service.appManagerVersion();
+    const QString latestVersion = online.latestVersion;
+    if (compareVersions(currentVersion, latestVersion) >= 0) {
+        appendLog(QStringLiteral("启动静默检测完成：AppManager 已是最新版本(v%1)").arg(currentVersion));
+        m_startupAutoUpdateRunning = false;
+        return;
+    }
+
+    appendLog(QStringLiteral("检测到 AppManager 新版本: v%1 -> v%2，开始静默升级")
+                  .arg(currentVersion, latestVersion));
+    if (statusBar()) {
+        statusBar()->showMessage(QStringLiteral("检测到 AppManager 新版本，正在后台升级..."));
+    }
+
+    QString result;
+    const bool ok = m_service.upgradeAppManager(
+        online,
+        result,
+        30000,
+        [&](qint64 received, qint64 total) {
+            Q_UNUSED(received)
+            Q_UNUSED(total)
+            QApplication::processEvents();
+        },
+        [&](const QString &status) {
+            if (statusBar()) {
+                statusBar()->showMessage(compactStatusText(QStringLiteral("[AppManager] %1").arg(status), 120));
+            }
+            QApplication::processEvents();
+        });
+
+    m_startupAutoUpdateRunning = false;
+
+    if (!ok) {
+        appendLog(QStringLiteral("AppManager 启动静默升级失败: %1").arg(result));
+        if (statusBar()) {
+            statusBar()->showMessage(QStringLiteral("AppManager 静默升级失败"), 5000);
+        }
+        return;
+    }
+
+    appendLog(QStringLiteral("AppManager 启动静默升级已启动: %1").arg(result));
+    if (statusBar()) {
+        statusBar()->showMessage(QStringLiteral("AppManager 正在升级，即将重启..."));
+    }
+
+    // 给用户与日志系统留出短暂缓冲，随后退出由安装程序接管。
+    QTimer::singleShot(1500, this, [this]() {
+        QApplication::quit();
+    });
+}
+
+void MainWindow::tryStartupAppsUpdateCheck()
+{
+    if (!m_serverConnected) {
+        return;
+    }
+
+    const QString org = QCoreApplication::organizationName().isEmpty()
+                            ? QStringLiteral("AppManager")
+                            : QCoreApplication::organizationName();
+    const QString appName = QCoreApplication::applicationName().isEmpty()
+                                ? QStringLiteral("AppManager")
+                                : QCoreApplication::applicationName();
+    QSettings settings(org, appName);
+    settings.beginGroup(QStringLiteral("startup_other_app_update_check"));
+
+    const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+    const qint64 lastCheckSec = settings.value(QStringLiteral("lastCheckEpoch"), 0).toLongLong();
+    if (lastCheckSec > 0 && (nowSec - lastCheckSec) < kStartupAppCheckCooldownSec) {
+        const qint64 remainMin = (kStartupAppCheckCooldownSec - (nowSec - lastCheckSec) + 59) / 60;
+        appendLog(QStringLiteral("启动更新检测已跳过（冷却中，约 %1 分钟后可再次检测）").arg(remainMin));
+        settings.endGroup();
+        return;
+    }
+
+    QVector<AppConfig> candidates;
+    for (const AppConfig &app : m_service.apps()) {
+        if (app.id.compare(QStringLiteral("appmanager"), Qt::CaseInsensitive) == 0
+            || app.name.compare(QStringLiteral("appmanager"), Qt::CaseInsensitive) == 0) {
+            continue;
+        }
+        if (!app.updateMetaUrl.isValid() || app.updateMetaUrl.isEmpty()) {
+            continue;
+        }
+        candidates.push_back(app);
+    }
+
+    if (candidates.isEmpty()) {
+        appendLog(QStringLiteral("启动更新检测：无可检测应用"));
+        settings.setValue(QStringLiteral("lastCheckEpoch"), nowSec);
+        settings.endGroup();
+        return;
+    }
+
+    int cursor = settings.value(QStringLiteral("cursor"), 0).toInt();
+    if (cursor < 0) {
+        cursor = 0;
+    }
+    const int total = candidates.size();
+    const int batch = total;
+
+    int checkedCount = 0;
+    int updateCount = 0;
+    int failCount = 0;
+
+    appendLog(QStringLiteral("启动更新检测：本次串行检测 %1 个应用").arg(total));
+
+    for (int i = 0; i < batch; ++i) {
+        const int idx = (cursor + i) % total;
+        const AppConfig &app = candidates.at(idx);
+
+        const OnlineAppInfo online = m_service.checkOnlineInfo(app);
+        ++checkedCount;
+
+        if (!online.requestSuccess) {
+            ++failCount;
+            appendLog(QStringLiteral("[%1] 启动检测失败: %2").arg(app.name, online.errorMessage));
+            continue;
+        }
+
+        m_onlineCache.insert(app.id, online);
+        const QString currentVersion = m_service.appCurrentVersion(app);
+        if (compareVersions(currentVersion, online.latestVersion) < 0) {
+            ++updateCount;
+            appendLog(QStringLiteral("[%1] 启动检测发现更新: %2 -> %3")
+                          .arg(app.name, currentVersion, online.latestVersion));
+        }
+    }
+
+    settings.setValue(QStringLiteral("lastCheckEpoch"), nowSec);
+    settings.setValue(QStringLiteral("cursor"), (cursor + checkedCount) % qMax(total, 1));
+    settings.endGroup();
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("启动检测完成：抽样%1个，发现更新%2个，失败%3个")
+                .arg(checkedCount)
+                .arg(updateCount)
+                .arg(failCount),
+            7000);
+    }
+
+    refreshAppIcons();
 }
 
 void MainWindow::fetchRemoteCatalog()
@@ -672,6 +923,12 @@ void MainWindow::fetchRemoteCatalog()
     for (const QJsonValue &v : catalog) {
         QJsonObject item = v.toObject();
         QString catalogAppId = item.value(QStringLiteral("appId")).toString();
+        
+        // 跳过 AppManager 本身，不在远程列表中显示
+        if (catalogAppId.toLower() == QStringLiteral("appmanager")) {
+            continue;
+        }
+        
         if (!m_appById.contains(catalogAppId)) {
             m_remoteCatalog.insert(catalogAppId, item);
         }
@@ -928,10 +1185,7 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
     // 获取历史版本列表
     logToFile(QStringLiteral("[%1] 正在获取历史版本列表...").arg(app.name));
     QProgressDialog fetchProgress(QStringLiteral("正在获取历史版本列表..."), QString(), 0, 0, this);
-    fetchProgress.setWindowModality(Qt::NonModal);
-    fetchProgress.setCancelButton(nullptr);
-    fetchProgress.setAutoClose(true);
-    fetchProgress.setAutoReset(true);
+    setupUnifiedProgressDialog(fetchProgress, QStringLiteral("正在获取历史版本列表..."), true);
     fetchProgress.show();
     QApplication::processEvents();
 
@@ -995,11 +1249,9 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
                                0,
                                100,
                                this);
-    dlProgress.setWindowModality(Qt::NonModal);
-    dlProgress.setCancelButton(nullptr);
-    dlProgress.setAutoClose(true);
-    dlProgress.setAutoReset(true);
-    dlProgress.setValue(0);
+    setupUnifiedProgressDialog(dlProgress,
+                               QStringLiteral("[%1] 正在下载历史版本 v%2...").arg(app.name, version),
+                               false);
     dlProgress.show();
     QApplication::processEvents();
 
@@ -1074,11 +1326,9 @@ void MainWindow::onDownloadRemoteApp(const QString &appId)
 
     logToFile(QStringLiteral("正在下载: %1...").arg(appName));
     QProgressDialog dlProgress(QStringLiteral("[%1] 正在下载应用...").arg(appName), QString(), 0, 100, this);
-    dlProgress.setWindowModality(Qt::NonModal);
-    dlProgress.setCancelButton(nullptr);
-    dlProgress.setAutoClose(true);
-    dlProgress.setAutoReset(true);
-    dlProgress.setValue(0);
+    setupUnifiedProgressDialog(dlProgress,
+                               QStringLiteral("[%1] 正在下载应用...").arg(appName),
+                               false);
     dlProgress.show();
     QApplication::processEvents();
 
@@ -1134,10 +1384,9 @@ void MainWindow::onDownloadRemoteApp(const QString &appId)
 
     // 下载完成后立即进行依赖文件检测
     QProgressDialog checkProgress(QStringLiteral("[%1] 正在检测依赖信息...").arg(appName), QString(), 0, 0, this);
-    checkProgress.setWindowModality(Qt::NonModal);
-    checkProgress.setCancelButton(nullptr);
-    checkProgress.setAutoClose(true);
-    checkProgress.setAutoReset(true);
+    setupUnifiedProgressDialog(checkProgress,
+                               QStringLiteral("[%1] 正在检测依赖信息...").arg(appName),
+                               true);
     checkProgress.show();
     QApplication::processEvents();
 
@@ -1147,11 +1396,9 @@ void MainWindow::onDownloadRemoteApp(const QString &appId)
     if (online.requestSuccess && !online.requiredFiles.isEmpty()) {
         logToFile(QStringLiteral("[%1] 正在检测依赖文件完整性...").arg(appName));
         QProgressDialog depProgress(QStringLiteral("[%1] 正在修复依赖...").arg(appName), QString(), 0, 100, this);
-        depProgress.setWindowModality(Qt::NonModal);
-        depProgress.setCancelButton(nullptr);
-        depProgress.setAutoClose(true);
-        depProgress.setAutoReset(true);
-        depProgress.setValue(0);
+        setupUnifiedProgressDialog(depProgress,
+                       QStringLiteral("[%1] 正在修复依赖...").arg(appName),
+                       false);
         depProgress.show();
         QApplication::processEvents();
 
@@ -1241,4 +1488,99 @@ QIcon MainWindow::createDownloadIcon(int size) const
 
     painter.end();
     return QIcon(pixmap);
+}
+
+// ============================================================
+// AppManager 自身升级
+// ============================================================
+
+void MainWindow::onCheckAppManagerUpdate()
+{
+    appendLog(QStringLiteral("正在检查 AppManager 新版本..."));
+    
+    QProgressDialog checkProgress(QStringLiteral("正在检查 AppManager 新版本..."), QString(), 0, 0, this);
+    setupUnifiedProgressDialog(checkProgress, QStringLiteral("正在检查 AppManager 新版本..."), true);
+    checkProgress.show();
+    QApplication::processEvents();
+
+    OnlineAppInfo online = m_service.checkAppManagerUpdate();
+    checkProgress.close();
+
+    if (!online.requestSuccess) {
+        logToFile(QStringLiteral("[AppManager] 检查更新失败: %1").arg(online.errorMessage));
+        QMessageBox::information(this, QStringLiteral("版本检查"), 
+                                QStringLiteral("检查更新失败: %1").arg(online.errorMessage));
+        return;
+    }
+
+    const QString currentVersion = m_service.appManagerVersion();
+    const QString latestVersion = online.latestVersion;
+    
+    logToFile(QStringLiteral("[AppManager] 当前版本: %1，最新版本: %2").arg(currentVersion, latestVersion));
+
+    if (compareVersions(currentVersion, latestVersion) >= 0) {
+        QMessageBox::information(this, QStringLiteral("版本检查"),
+                                QStringLiteral("AppManager 已是最新版本 (v%1)").arg(currentVersion));
+        return;
+    }
+
+    // 提示用户升级
+    QMessageBox::StandardButton ret = QMessageBox::question(
+        this,
+        QStringLiteral("发现新版本"),
+        QStringLiteral("发现 AppManager 新版本 v%1\n\n当前版本: v%2\n\n是否立即升级?")
+            .arg(latestVersion, currentVersion),
+        QMessageBox::Yes | QMessageBox::No);
+
+    if (ret == QMessageBox::Yes) {
+        appendLog(QStringLiteral("正在下载 AppManager v%1...").arg(latestVersion));
+        
+        QProgressDialog dlProgress(QStringLiteral("正在下载 AppManager..."), QString(), 0, 100, this);
+        setupUnifiedProgressDialog(dlProgress, QStringLiteral("正在下载 AppManager..."), false);
+        dlProgress.show();
+        QApplication::processEvents();
+
+        QString result;
+        if (!m_service.upgradeAppManager(
+                online,
+                result,
+                30000,
+                [&](qint64 received, qint64 total) {
+                    if (total > 0) {
+                        const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
+                        dlProgress.setValue(p);
+                    }
+                    QApplication::processEvents();
+                },
+                [&](const QString &status) {
+                    dlProgress.setLabelText(compactStatusText(status, 120));
+                    QApplication::processEvents();
+                })) {
+            dlProgress.close();
+            logToFile(QStringLiteral("[AppManager] 升级失败: %1").arg(result));
+            QMessageBox::warning(this, QStringLiteral("升级失败"), result);
+        } else {
+            dlProgress.setValue(100);
+            dlProgress.close();
+            logToFile(QStringLiteral("[AppManager] %1").arg(result));
+            QMessageBox::information(this, QStringLiteral("升级进行中"),
+                                    QStringLiteral("[AppManager] %1").arg(result));
+            
+            // 2秒后关闭应用，让安装程序进行
+            QTimer::singleShot(2000, this, [this]() {
+                QApplication::quit();
+            });
+        }
+    }
+}
+
+void MainWindow::onAboutAppManager()
+{
+    const QString appVersion = m_service.appManagerVersion();
+    QMessageBox::about(this, QStringLiteral("关于 AppManager"),
+                       QStringLiteral("AppManager v%1\n\n"
+                                      "应用管理和升级工具\n\n"
+                                      "© 2024-2025\n\n"
+                                      "点击菜单中的'检查更新'可查询新版本")
+                           .arg(appVersion));
 }

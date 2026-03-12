@@ -1,0 +1,14 @@
+﻿{
+  "description": "ZIP升级替换清单（相对 appsRoot），可动态增删 files 项。",
+  "files": [
+    "managed_apps/BCTester.exe",
+    "managed_apps/bctester.ini",
+
+    "managed_apps/ReportCenter/ReportCenter.exe",
+    "managed_apps/ReportCenter/settings.json",
+    "managed_apps/ReportCenter/templates/default.tpl",
+
+    "managed_apps/DataSync/DataSync.exe",
+    "managed_apps/DataSync/sync_rules.json"
+  ]
+}

@@ -1728,3 +1728,111 @@ bool AppManagerService::saveConfig(QString &errorMessage)
     file.close();
     return true;
 }
+
+// ====================================================================
+// AppManager 自身升级支持
+// ====================================================================
+
+QString AppManagerService::appManagerVersion() const
+{
+    const QString appExePath = QCoreApplication::applicationFilePath();
+    const QString version = getFileVersion(appExePath);
+    return version.isEmpty() ? QStringLiteral("1.0.0") : version;
+}
+
+OnlineAppInfo AppManagerService::checkAppManagerUpdate(int timeoutMs)
+{
+    OnlineAppInfo result;
+    
+    // 从服务器的 /updates/AppManager.json 获取版本信息
+    const QUrl updateMetaUrl = QUrl(m_serverBaseUrl.trimmed() + QStringLiteral("/updates/AppManager.json"));
+    
+    QString errorMessage;
+    const QByteArray responseData = httpGet(updateMetaUrl, errorMessage, timeoutMs);
+    
+    if (!errorMessage.isEmpty() || responseData.isEmpty()) {
+        result.errorMessage = !errorMessage.isEmpty() 
+            ? errorMessage 
+            : QStringLiteral("AppManager 更新元数据为空");
+        return result;
+    }
+    
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(responseData, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        result.errorMessage = QStringLiteral("AppManager 更新元数据 JSON 格式错误");
+        return result;
+    }
+    
+    const QJsonObject obj = doc.object();
+    result.latestVersion = obj.value(QStringLiteral("latestVersion")).toString().trimmed();
+    QString downloadUrlStr = obj.value(QStringLiteral("downloadUrl")).toString().trimmed();
+    
+    // 将下载URL调整为配置的服务器地址
+    if (!downloadUrlStr.isEmpty()) {
+        QUrl baseUrl(m_serverBaseUrl);
+        QUrl rawUrl(downloadUrlStr);
+        result.downloadUrl = rebaseToConfiguredServer(downloadUrlStr, rawUrl, m_serverBaseUrl);
+    }
+    
+    if (result.latestVersion.isEmpty() || !result.downloadUrl.isValid()) {
+        result.errorMessage = QStringLiteral("AppManager 更新元数据缺少 latestVersion 或 downloadUrl");
+        return result;
+    }
+    
+    result.requestSuccess = true;
+    return result;
+}
+
+bool AppManagerService::upgradeAppManager(const OnlineAppInfo &online,
+                                          QString &resultMessage,
+                                          int timeoutMs,
+                                          const DownloadProgressCallback &progressCallback,
+                                          const StatusCallback &statusCallback)
+{
+    if (!online.downloadUrl.isValid()) {
+        resultMessage = QStringLiteral("下载URL无效");
+        return false;
+    }
+    
+    // 获取可执行文件所在目录
+    const QString appBinDir = QFileInfo(QCoreApplication::applicationFilePath()).absolutePath();
+    const QString tempDir = QDir::tempPath();
+    
+    // 下载安装程序到临时目录
+    const QString installerFileName = QStringLiteral("AppManagerSetup_%1.exe")
+                                        .arg(online.latestVersion);
+    const QString installerPath = QDir(tempDir).absoluteFilePath(installerFileName);
+    
+    if (statusCallback) {
+        statusCallback(QStringLiteral("正在下载 AppManager 安装程序..."));
+    }
+    
+    if (!downloadToFile(online.downloadUrl, installerPath, resultMessage, 
+                        timeoutMs, progressCallback, statusCallback)) {
+        return false;
+    }
+    
+    if (statusCallback) {
+        statusCallback(QStringLiteral("下载完成，正在启动安装程序..."));
+    }
+    
+    // 启动安装程序
+    // 使用 /SILENT /NORESTART 选项进行静默安装
+    // 创建延时脚本让当前进程安全关闭
+    QStringList arguments;
+    arguments << QStringLiteral("/SILENT");
+    arguments << QStringLiteral("/NORESTART");
+    
+    // 使用QProcess启动安装程序
+    QProcess process;
+    process.setProcessChannelMode(QProcess::MergedChannels);
+    
+    if (!process.startDetached(installerPath, arguments)) {
+        resultMessage = QStringLiteral("启动安装程序失败: %1").arg(installerPath);
+        return false;
+    }
+    
+    resultMessage = QStringLiteral("安装程序已启动，AppManager 将在完成安装后自动重启");
+    return true;
+}
