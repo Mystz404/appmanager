@@ -62,6 +62,29 @@ struct AppConfig
      * - 约束：必须是有效 URL（http/https）；服务端应返回 JSON。
      */
     QUrl updateMetaUrl;
+
+    /**
+     * @brief 是否为本地手动添加应用。
+     *
+     * - true：由用户通过“添加本地应用”选择 EXE 添加；
+     * - false：来自服务端托管应用清单。
+     */
+    bool isLocalApp = false;
+    /**
+     * @brief 是否为从历史版本下载的应用副本。
+     *
+     * - true：由"下载历史版本"功能下载；
+     * - 此类应用不参与在线更新检测，右键菜单与本地应用相同。
+     */
+    bool isHistoryVersion = false;
+
+    /**
+     * @brief 是否允许多开（由服务端下发）。
+     *
+     * - true：右上角菜单显示“在新窗口打开”；
+     * - false：只保留单实例前台激活行为。
+     */
+    bool allowMultiInstance = false;
 };
 
 /**

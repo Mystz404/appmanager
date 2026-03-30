@@ -249,6 +249,155 @@ QUrl buildUpdateMetaUrlByAppId(const QString &serverBaseUrl, const QString &appI
     return url;
 }
 
+QUrl normalizeServerBaseUrl(const QString &serverBaseUrl)
+{
+    QString candidate = serverBaseUrl.trimmed();
+    if (candidate.isEmpty()) {
+        return {};
+    }
+
+    if (!candidate.contains(QStringLiteral("://"))) {
+        candidate.prepend(QStringLiteral("http://"));
+    }
+
+    QUrl url(candidate);
+    if (!url.isValid() || url.host().isEmpty()) {
+        return {};
+    }
+
+    QString path = url.path();
+    if (path.isEmpty()) {
+        path = QStringLiteral("/");
+    }
+    if (!path.endsWith('/')) {
+        path += '/';
+    }
+    url.setPath(path);
+    return url;
+}
+
+bool parseAppsArray(const QJsonArray &appsArray,
+                    QVector<AppConfig> &parsedApps,
+                    QString &errorMessage)
+{
+    parsedApps.clear();
+    parsedApps.reserve(appsArray.size());
+
+    for (int i = 0; i < appsArray.size(); ++i) {
+        if (!appsArray.at(i).isObject()) {
+            errorMessage = QStringLiteral("第 %1 个应用配置格式无效").arg(i + 1);
+            return false;
+        }
+
+        const QJsonObject obj = appsArray.at(i).toObject();
+        AppConfig app;
+        app.id = obj.value(QStringLiteral("id")).toString().trimmed();
+        app.name = obj.value(QStringLiteral("name")).toString().trimmed();
+        app.exeRelativePath = obj.value(QStringLiteral("exe")).toString().trimmed();
+        app.isLocalApp = obj.value(QStringLiteral("isLocalApp")).toBool(false)
+                         || obj.value(QStringLiteral("source")).toString().compare(QStringLiteral("local"), Qt::CaseInsensitive) == 0;
+        app.isHistoryVersion = obj.value(QStringLiteral("isHistoryVersion")).toBool(false);
+        app.allowMultiInstance = obj.value(QStringLiteral("allowMultiInstance")).toBool(false);
+
+        const QUrl configuredMetaUrl = QUrl(obj.value(QStringLiteral("updateMetaUrl")).toString().trimmed());
+        if (configuredMetaUrl.isValid() && !configuredMetaUrl.isEmpty()) {
+            app.updateMetaUrl = configuredMetaUrl;
+        }
+
+        const QJsonArray reqArray = obj.value(QStringLiteral("requiredFiles")).toArray();
+        for (const QJsonValue &value : reqArray) {
+            const QString relativeFile = value.toString().trimmed();
+            if (!relativeFile.isEmpty()) {
+                app.requiredRelativeFiles.append(relativeFile);
+            }
+        }
+
+        if (app.id.isEmpty() || app.name.isEmpty() || app.exeRelativePath.isEmpty()) {
+            errorMessage = QStringLiteral("第 %1 个应用配置不完整").arg(i + 1);
+            return false;
+        }
+
+        parsedApps.push_back(app);
+    }
+
+    return true;
+}
+
+bool loadPersistedApps(const QString &appListPath,
+                       bool &exists,
+                       QJsonArray &appsArray,
+                       QString &errorMessage)
+{
+    exists = false;
+    appsArray = QJsonArray();
+
+    const QFileInfo fileInfo(appListPath);
+    if (!fileInfo.exists()) {
+        return true;
+    }
+    exists = true;
+
+    QFile file(appListPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        errorMessage = QStringLiteral("无法打开客户端应用列表: %1").arg(appListPath);
+        return false;
+    }
+
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    file.close();
+    if (parseError.error != QJsonParseError::NoError) {
+        errorMessage = QStringLiteral("客户端应用列表 JSON 格式错误: %1").arg(parseError.errorString());
+        return false;
+    }
+
+    if (doc.isArray()) {
+        appsArray = doc.array();
+        return true;
+    }
+
+    if (doc.isObject()) {
+        appsArray = doc.object().value(QStringLiteral("apps")).toArray();
+        return true;
+    }
+
+    errorMessage = QStringLiteral("客户端应用列表格式无效: %1").arg(appListPath);
+    return false;
+}
+
+QJsonArray buildAppsArray(const QVector<AppConfig> &apps)
+{
+    QJsonArray appsArray;
+    for (const AppConfig &app : apps) {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("id"), app.id);
+        obj.insert(QStringLiteral("name"), app.name);
+        obj.insert(QStringLiteral("exe"), app.exeRelativePath);
+        if (app.isLocalApp) {
+            obj.insert(QStringLiteral("source"), QStringLiteral("local"));
+            obj.insert(QStringLiteral("isLocalApp"), true);
+        }
+        if (app.isHistoryVersion) {
+            obj.insert(QStringLiteral("isHistoryVersion"), true);
+        }
+        if (app.allowMultiInstance) {
+            obj.insert(QStringLiteral("allowMultiInstance"), true);
+        }
+        if (app.updateMetaUrl.isValid() && !app.updateMetaUrl.isEmpty()) {
+            obj.insert(QStringLiteral("updateMetaUrl"), app.updateMetaUrl.toString());
+        }
+        if (!app.requiredRelativeFiles.isEmpty()) {
+            QJsonArray reqArr;
+            for (const QString &f : app.requiredRelativeFiles) {
+                reqArr.append(f);
+            }
+            obj.insert(QStringLiteral("requiredFiles"), reqArr);
+        }
+        appsArray.append(obj);
+    }
+    return appsArray;
+}
+
 }
 
 AppManagerService::AppManagerService(QObject *parent)
@@ -259,6 +408,7 @@ AppManagerService::AppManagerService(QObject *parent)
 bool AppManagerService::loadConfig(const QString &configPath, QString &errorMessage)
 {
     m_configPath = configPath;
+    m_appListPath = QFileInfo(configPath).absoluteDir().absoluteFilePath(QStringLiteral("client_apps.json"));
     QFile file(configPath);
     if (!file.open(QIODevice::ReadOnly)) {
         errorMessage = QStringLiteral("无法打开配置文件: %1").arg(configPath);
@@ -279,9 +429,14 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
     m_appsRootRaw = root.value(QStringLiteral("appsRoot")).toString().trimmed();
     m_serverBaseUrl = root.value(QStringLiteral("serverBaseUrl")).toString().trimmed();
 
+    const QUrl normalizedBase = normalizeServerBaseUrl(m_serverBaseUrl);
+    if (normalizedBase.isValid() && !normalizedBase.host().isEmpty()) {
+        m_serverBaseUrl = normalizedBase.toString(QUrl::FullyEncoded);
+    }
+
     const QUrl baseServerUrl(m_serverBaseUrl);
     if (m_serverBaseUrl.isEmpty() || !baseServerUrl.isValid() || baseServerUrl.host().isEmpty()) {
-        errorMessage = QStringLiteral("serverBaseUrl 未配置或格式无效，请在 apps.json 中配置有效服务器地址");
+        errorMessage = QStringLiteral("serverBaseUrl 未配置或格式无效，请在配置文件中填写有效服务器地址");
         return false;
     }
 
@@ -301,48 +456,41 @@ bool AppManagerService::loadConfig(const QString &configPath, QString &errorMess
         m_appsRoot = rootDir.absolutePath();
     }
 
-    const QJsonArray appsArray = root.value(QStringLiteral("apps")).toArray();
-    if (appsArray.isEmpty()) {
-        errorMessage = QStringLiteral("配置中未定义任何应用（apps 为空）");
+    const QJsonArray legacyAppsArray = root.value(QStringLiteral("apps")).toArray();
+    bool hasPersistedAppsFile = false;
+    QJsonArray persistedAppsArray;
+    if (!loadPersistedApps(m_appListPath, hasPersistedAppsFile, persistedAppsArray, errorMessage)) {
         return false;
     }
 
+    const QJsonArray effectiveAppsArray = hasPersistedAppsFile ? persistedAppsArray : legacyAppsArray;
+
     QVector<AppConfig> parsedApps;
-    parsedApps.reserve(appsArray.size());
-
-    for (int i = 0; i < appsArray.size(); ++i) {
-        const QJsonObject obj = appsArray.at(i).toObject();
-        AppConfig app;
-        app.id = obj.value(QStringLiteral("id")).toString().trimmed();
-        app.name = obj.value(QStringLiteral("name")).toString().trimmed();
-        app.exeRelativePath = obj.value(QStringLiteral("exe")).toString().trimmed();
-
-        const QJsonArray reqArray = obj.value(QStringLiteral("requiredFiles")).toArray();
-        for (const QJsonValue &value : reqArray) {
-            const QString relativeFile = value.toString().trimmed();
-            if (!relativeFile.isEmpty()) {
-                app.requiredRelativeFiles.append(relativeFile);
-            }
-        }
-
-        if (app.id.isEmpty() || app.name.isEmpty() || app.exeRelativePath.isEmpty()) {
-            errorMessage = QStringLiteral("第 %1 个应用配置不完整").arg(i + 1);
-            return false;
-        }
-
-        parsedApps.push_back(app);
+    if (!parseAppsArray(effectiveAppsArray, parsedApps, errorMessage)) {
+        return false;
     }
 
     m_apps = parsedApps;
 
     // 统一使用 serverBaseUrl 生成 updateMetaUrl。
     for (AppConfig &app : m_apps) {
+        if (app.isLocalApp) {
+            continue;
+        }
         const QUrl generated = buildUpdateMetaUrlByAppId(m_serverBaseUrl, app.id);
         if (!generated.isValid() || generated.isEmpty()) {
             errorMessage = QStringLiteral("无法根据 serverBaseUrl 生成应用元数据地址: %1").arg(app.id);
             return false;
         }
         app.updateMetaUrl = generated;
+    }
+
+    if (!hasPersistedAppsFile) {
+        QString migrateError;
+        if (!saveConfig(migrateError)) {
+            errorMessage = QStringLiteral("迁移客户端应用列表失败: %1").arg(migrateError);
+            return false;
+        }
     }
 
     return true;
@@ -404,10 +552,24 @@ bool AppManagerService::checkRequiredFiles(const AppConfig &app, QStringList &mi
     return missingFiles.isEmpty();
 }
 
+QStringList AppManagerService::missingRequiredDeps(const AppConfig &app) const
+{
+    QStringList missing;
+    const QString appInstallDir = appAbsoluteDir(app);
+    for (const QString &relFile : app.requiredRelativeFiles) {
+        if (!QFileInfo::exists(requiredFileAbsolutePath(appInstallDir, relFile))) {
+            missing.push_back(relFile);
+        }
+    }
+    return missing;
+}
+
 QByteArray AppManagerService::httpGet(const QUrl &url,
                                       QString &errorMessage,
                                       int timeoutMs,
-                                      const DownloadProgressCallback &progressCallback) const
+                                      const DownloadProgressCallback &progressCallback,
+                                      const CancelCallback &cancelCallback,
+                                      const QByteArray &authToken) const
 {
     if (!url.isValid()) {
         errorMessage = QStringLiteral("无效 URL: %1").arg(url.toString());
@@ -418,11 +580,19 @@ QByteArray AppManagerService::httpGet(const QUrl &url,
     request.setAttribute(
         QNetworkRequest::RedirectPolicyAttribute,
         QNetworkRequest::NoLessSafeRedirectPolicy);
+    request.setRawHeader("User-Agent", "AppManager/" APP_VERSION " (Windows; Qt/5.15)");
+    if (!authToken.isEmpty()) {
+        request.setRawHeader("Authorization", "Bearer " + authToken);
+    }
 
     QNetworkReply *reply = m_networkManager.get(request);
     QEventLoop loop;
     QTimer timer;
+    QTimer cancelPoll;
     timer.setSingleShot(true);
+    cancelPoll.setSingleShot(false);
+
+    bool canceled = false;
 
     if (progressCallback) {
         QObject::connect(reply, &QNetworkReply::downloadProgress, &loop,
@@ -439,14 +609,37 @@ QByteArray AppManagerService::httpGet(const QUrl &url,
         loop.quit();
     });
 
+    if (cancelCallback) {
+        QObject::connect(&cancelPoll, &QTimer::timeout, &loop, [&]() {
+            if (!reply->isRunning()) {
+                return;
+            }
+            if (cancelCallback()) {
+                canceled = true;
+                reply->abort();
+                loop.quit();
+            }
+        });
+        cancelPoll.start(80);
+    }
+
     timer.start(timeoutMs);
     loop.exec();
+
+    if (cancelPoll.isActive()) {
+        cancelPoll.stop();
+    }
 
     const bool timeout = !timer.isActive();
     const QNetworkReply::NetworkError netError = reply->error();
     const QByteArray response = reply->readAll();
     const QString netErrorStr = reply->errorString();
     reply->deleteLater();
+
+    if (canceled) {
+        errorMessage = QStringLiteral("请求已取消");
+        return {};
+    }
 
     if (timeout) {
         errorMessage = QStringLiteral("请求超时: %1").arg(url.toString());
@@ -461,12 +654,15 @@ QByteArray AppManagerService::httpGet(const QUrl &url,
     return response;
 }
 
-OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app, int timeoutMs)
+OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app,
+                                                 int timeoutMs,
+                                                 const CancelCallback &cancelCallback)
 {
     OnlineAppInfo info;
 
     QString errorMessage;
-    const QByteArray body = httpGet(app.updateMetaUrl, errorMessage, timeoutMs);
+    const QByteArray body = httpGet(app.updateMetaUrl, errorMessage, timeoutMs,
+                                    DownloadProgressCallback(), cancelCallback);
     if (!errorMessage.isEmpty()) {
         info.requestSuccess = false;
         info.errorMessage = errorMessage;
@@ -583,7 +779,8 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
                                                  int timeoutMs,
                                                  const DownloadProgressCallback &progressCallback,
                                                  const StatusCallback &statusCallback,
-                                                 const InstallProgressCallback &installProgressCallback)
+                                                 const InstallProgressCallback &installProgressCallback,
+                                                 const CancelCallback &cancelCallback)
 {
     // 没有服务器指定的依赖文件列表，跳过检查
     if (online.requiredFiles.isEmpty()) {
@@ -643,7 +840,8 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
                                 downloadError,
                                 timeoutMs,
                                 progressCallback,
-                                statusCallback)) {
+                                statusCallback,
+                                cancelCallback)) {
         resultMessage = QStringLiteral("完整包下载失败：%1").arg(downloadError);
         return false;
     }
@@ -813,7 +1011,8 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
                                    int timeoutMs,
                                    const DownloadProgressCallback &progressCallback,
                                    const StatusCallback &statusCallback,
-                                   const InstallProgressCallback &installProgressCallback)
+                                   const InstallProgressCallback &installProgressCallback,
+                                   const CancelCallback &cancelCallback)
 {
     if (!online.requestSuccess) {
         resultMessage = QStringLiteral("无法升级，在线信息不可用: %1").arg(online.errorMessage);
@@ -853,7 +1052,8 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
                                 downloadError,
                                 timeoutMs,
                                 progressCallback,
-                                statusCallback)) {
+                                statusCallback,
+                                cancelCallback)) {
         resultMessage = QStringLiteral("升级失败：下载中断或下载失败（支持断点续传）：%1").arg(downloadError);
         if (statusCallback) {
             statusCallback(resultMessage);
@@ -881,6 +1081,13 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
         }
         QCryptographicHash hash(QCryptographicHash::Sha256);
         while (!file.atEnd()) {
+            if (cancelCallback && cancelCallback()) {
+                resultMessage = QStringLiteral("升级已取消");
+                if (statusCallback) {
+                    statusCallback(resultMessage);
+                }
+                return false;
+            }
             hash.addData(file.read(64 * 1024));
         }
         const QString digest = QString::fromLatin1(hash.result().toHex()).toLower();
@@ -1328,7 +1535,8 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
                                                QString &errorMessage,
                                                int timeoutMs,
                                                const DownloadProgressCallback &progressCallback,
-                                               const StatusCallback &statusCallback) const
+                                               const StatusCallback &statusCallback,
+                                               const CancelCallback &cancelCallback) const
 {
     if (!url.isValid()) {
         errorMessage = QStringLiteral("无效下载 URL: %1").arg(url.toString());
@@ -1366,6 +1574,7 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         request.setAttribute(
             QNetworkRequest::RedirectPolicyAttribute,
             QNetworkRequest::NoLessSafeRedirectPolicy);
+        request.setRawHeader("User-Agent", "AppManager/" APP_VERSION " (Windows; Qt/5.15)");
         if (useRange) {
             request.setRawHeader("Range", QByteArray("bytes=") + QByteArray::number(downloadedBytes) + "-");
         }
@@ -1387,7 +1596,11 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         QNetworkReply *reply = m_networkManager.get(request);
         QEventLoop loop;
         QTimer timer;
+        QTimer cancelPoll;
         timer.setSingleShot(true);
+        cancelPoll.setSingleShot(false);
+
+        bool canceled = false;
 
         QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() {
             const QByteArray chunk = reply->readAll();
@@ -1417,8 +1630,26 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
             loop.quit();
         });
 
+        if (cancelCallback) {
+            QObject::connect(&cancelPoll, &QTimer::timeout, &loop, [&]() {
+                if (!reply->isRunning()) {
+                    return;
+                }
+                if (cancelCallback()) {
+                    canceled = true;
+                    reply->abort();
+                    loop.quit();
+                }
+            });
+            cancelPoll.start(80);
+        }
+
         timer.start(timeoutMs);
         loop.exec();
+
+        if (cancelPoll.isActive()) {
+            cancelPoll.stop();
+        }
 
         const bool timeout = !timer.isActive();
         const auto netError = reply->error();
@@ -1452,6 +1683,11 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         downloadedBytes = QFileInfo(partPath).exists() ? QFileInfo(partPath).size() : 0;
 
         reply->deleteLater();
+
+        if (canceled) {
+            errorMessage = QStringLiteral("下载已取消");
+            return false;
+        }
 
         if (useRange && httpStatus == 200) {
             if (statusCallback) {
@@ -1552,7 +1788,9 @@ bool AppManagerService::tryConnectServer(int timeoutMs)
     return errorMessage.isEmpty();
 }
 
-QJsonArray AppManagerService::fetchAppCatalog(int timeoutMs)
+QJsonArray AppManagerService::fetchAppCatalog(const QString &authToken,
+                                              int timeoutMs,
+                                              const CancelCallback &cancelCallback)
 {
     if (m_serverBaseUrl.isEmpty()) {
         return {};
@@ -1560,7 +1798,9 @@ QJsonArray AppManagerService::fetchAppCatalog(int timeoutMs)
 
     QString errorMessage;
     QByteArray response = httpGet(QUrl(m_serverBaseUrl + QStringLiteral("/catalog")),
-                                  errorMessage, timeoutMs);
+                                  errorMessage, timeoutMs,
+                                  DownloadProgressCallback(), cancelCallback,
+                                  authToken.toUtf8());
     if (!errorMessage.isEmpty()) {
         return {};
     }
@@ -1604,7 +1844,9 @@ QJsonArray AppManagerService::fetchAppCatalog(int timeoutMs)
     return normalized;
 }
 
-QJsonObject AppManagerService::fetchHistoryVersions(const QString &appId, int timeoutMs)
+QJsonObject AppManagerService::fetchHistoryVersions(const QString &appId,
+                                                    int timeoutMs,
+                                                    const CancelCallback &cancelCallback)
 {
     if (m_serverBaseUrl.isEmpty()) {
         return {};
@@ -1612,7 +1854,8 @@ QJsonObject AppManagerService::fetchHistoryVersions(const QString &appId, int ti
 
     QString errorMessage;
     QByteArray response = httpGet(QUrl(m_serverBaseUrl + QStringLiteral("/history/") + appId),
-                                  errorMessage, timeoutMs);
+                                  errorMessage, timeoutMs,
+                                  DownloadProgressCallback(), cancelCallback);
     if (!errorMessage.isEmpty()) {
         return {};
     }
@@ -1654,14 +1897,16 @@ bool AppManagerService::downloadToFile(const QUrl &url,
                                        QString &errorMessage,
                                        int timeoutMs,
                                        const DownloadProgressCallback &progressCallback,
-                                       const StatusCallback &statusCallback)
+                                       const StatusCallback &statusCallback,
+                                       const CancelCallback &cancelCallback)
 {
     return downloadFileWithResume(url,
                                   filePath,
                                   errorMessage,
                                   timeoutMs,
                                   progressCallback,
-                                  statusCallback);
+                                  statusCallback,
+                                  cancelCallback);
 }
 
 // ============================================================================
@@ -1686,42 +1931,17 @@ bool AppManagerService::removeAppEntry(const QString &appId)
 
 bool AppManagerService::saveConfig(QString &errorMessage)
 {
-    if (m_configPath.isEmpty()) {
-        errorMessage = QStringLiteral("无配置文件路径");
+    if (m_appListPath.isEmpty()) {
+        errorMessage = QStringLiteral("无客户端应用列表路径");
         return false;
     }
 
     QJsonObject root;
-    if (!m_appsRootRaw.isEmpty()) {
-        root.insert(QStringLiteral("appsRoot"), m_appsRootRaw);
-    }
-    if (!m_serverBaseUrl.isEmpty()) {
-        root.insert(QStringLiteral("serverBaseUrl"), m_serverBaseUrl);
-    }
+    root.insert(QStringLiteral("apps"), buildAppsArray(m_apps));
 
-    QJsonArray appsArray;
-    for (const AppConfig &app : m_apps) {
-        QJsonObject obj;
-        obj.insert(QStringLiteral("id"), app.id);
-        obj.insert(QStringLiteral("name"), app.name);
-        obj.insert(QStringLiteral("exe"), app.exeRelativePath);
-        if (app.updateMetaUrl.isValid() && !app.updateMetaUrl.isEmpty()) {
-            obj.insert(QStringLiteral("updateMetaUrl"), app.updateMetaUrl.toString());
-        }
-        if (!app.requiredRelativeFiles.isEmpty()) {
-            QJsonArray reqArr;
-            for (const QString &f : app.requiredRelativeFiles) {
-                reqArr.append(f);
-            }
-            obj.insert(QStringLiteral("requiredFiles"), reqArr);
-        }
-        appsArray.append(obj);
-    }
-    root.insert(QStringLiteral("apps"), appsArray);
-
-    QFile file(m_configPath);
+    QFile file(m_appListPath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        errorMessage = QStringLiteral("无法写入配置文件: %1").arg(m_configPath);
+        errorMessage = QStringLiteral("无法写入客户端应用列表: %1").arg(m_appListPath);
         return false;
     }
     file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
@@ -1835,4 +2055,86 @@ bool AppManagerService::upgradeAppManager(const OnlineAppInfo &online,
     
     resultMessage = QStringLiteral("安装程序已启动，AppManager 将在完成安装后自动重启");
     return true;
+}
+
+// ============================================================
+// 文档管理
+// ============================================================
+
+QVector<ClientDocEntry> AppManagerService::fetchDocCatalog(int timeoutMs,
+                                                            const CancelCallback &cancelCallback)
+{
+    if (m_serverBaseUrl.isEmpty()) return {};
+
+    const QString url = m_serverBaseUrl + QStringLiteral("/docs/catalog");
+    QString err;
+    const QByteArray response = httpGet(QUrl(url), err, timeoutMs, {}, cancelCallback);
+    if (response.isEmpty()) return {};
+
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(response, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) return {};
+
+    // 用客户端自己的 m_serverBaseUrl 重建 downloadUrl，
+    // 避免服务端 effectiveBaseUrl 与客户端配置的服务器地址不一致（如服务端返回
+    // http://127.0.0.1:PORT，而客户端需要通过公网域名访问）。
+    QString base = m_serverBaseUrl;
+    if (base.endsWith('/')) base.chop(1);
+
+    QVector<ClientDocEntry> result;
+    for (const QJsonValue &v : doc.array()) {
+        if (v.isObject()) {
+            ClientDocEntry e = ClientDocEntry::fromJson(v.toObject());
+            // 根据 docId + fileName 重建下载 URL，无论服务端返回什么都以本地配置为准
+            if (!e.docId.isEmpty() && !e.fileName.isEmpty())
+                e.downloadUrl = base + QStringLiteral("/docs/download/") + e.docId + QStringLiteral("/") + e.fileName;
+            result.append(e);
+        }
+    }
+    return result;
+}
+
+QString AppManagerService::localDocCacheDir() const
+{
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/docs");
+}
+
+QString AppManagerService::localDocFilePath(const ClientDocEntry &doc) const
+{
+    return QDir(localDocCacheDir()).absoluteFilePath(
+        doc.docId + QStringLiteral("/") + doc.fileName);
+}
+
+bool AppManagerService::isDocDownloaded(const ClientDocEntry &doc) const
+{
+    return QFileInfo::exists(localDocFilePath(doc));
+}
+
+bool AppManagerService::isDocUpToDate(const ClientDocEntry &doc) const
+{
+    if (!isDocDownloaded(doc)) return false;
+    if (doc.sha256.isEmpty())  return true;
+    const QString local = localDocFilePath(doc);
+    QFile f(local);
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    const QString localSha = QString::fromLatin1(
+        QCryptographicHash::hash(f.readAll(), QCryptographicHash::Sha256).toHex());
+    return localSha.compare(doc.sha256, Qt::CaseInsensitive) == 0;
+}
+
+bool AppManagerService::downloadDoc(const ClientDocEntry &doc,
+                                    QString &errorMessage,
+                                    int timeoutMs,
+                                    const DownloadProgressCallback &progressCallback,
+                                    const CancelCallback &cancelCallback)
+{
+    if (doc.downloadUrl.isEmpty()) {
+        errorMessage = QStringLiteral("文档下载地址为空");
+        return false;
+    }
+    const QString localPath = localDocFilePath(doc);
+    QDir().mkpath(QFileInfo(localPath).absolutePath());
+    return downloadFileWithResume(QUrl(doc.downloadUrl), localPath,
+                                  errorMessage, timeoutMs,
+                                  progressCallback, {}, cancelCallback);
 }

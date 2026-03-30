@@ -123,7 +123,14 @@ QWidget *UpdateDialog::createCheckPage()
     btnRow->addWidget(cancelBtn);
     ly->addLayout(btnRow);
 
-    connect(cancelBtn, &QPushButton::clicked, this, [this]() { m_canceled = true; });
+    connect(cancelBtn, &QPushButton::clicked, this, [this]() {
+        if (m_canceled) {
+            return;
+        }
+        m_canceled = true;
+        m_checkLabel->setText(QStringLiteral("正在取消检测，请稍候..."));
+        emitLog(QStringLiteral("用户取消在线检测，正在中止当前请求"));
+    });
 
     return page;
 }
@@ -230,7 +237,14 @@ QWidget *UpdateDialog::createUpgradePage()
     btnRow->addWidget(cancelBtn);
     ly->addLayout(btnRow);
 
-    connect(cancelBtn, &QPushButton::clicked, this, [this]() { m_canceled = true; });
+    connect(cancelBtn, &QPushButton::clicked, this, [this]() {
+        if (m_canceled) {
+            return;
+        }
+        m_canceled = true;
+        m_upgradeLabel->setText(QStringLiteral("正在取消升级，请稍候..."));
+        emitLog(QStringLiteral("用户取消升级，正在中止当前任务"));
+    });
 
     return page;
 }
@@ -269,6 +283,7 @@ QWidget *UpdateDialog::createResultPage()
 
 void UpdateDialog::runCheckPhase()
 {
+    m_canceled = false;
     m_checkProgress->setMaximum(m_apps.size());
 
     for (int i = 0; i < m_apps.size(); ++i) {
@@ -283,7 +298,15 @@ void UpdateDialog::runCheckPhase()
                                   .arg(app.name));
         QApplication::processEvents();
 
-        const OnlineAppInfo online = m_service->checkOnlineInfo(app);
+        const OnlineAppInfo online = m_service->checkOnlineInfo(
+            app,
+            10000,
+            [this]() { return m_canceled; });
+        if (m_canceled) {
+            m_checkProgress->setValue(i + 1);
+            QApplication::processEvents();
+            break;
+        }
         m_onlineCache.insert(app.id, online);
 
         if (!online.requestSuccess) {
@@ -307,8 +330,11 @@ void UpdateDialog::runCheckPhase()
     }
 
     if (m_canceled) {
-        emitLog(QStringLiteral("检测升级操作被用户取消"));
-        return; // reject() 已在 cancel 时调用
+        emitLog(QStringLiteral("检测升级操作被取消"));
+        showResultPhase(
+            QStringLiteral("检测已取消"),
+            QStringLiteral("已取消在线检测。\n如需继续，请重新检测。"));
+        return;
     }
 
     emitLog(QStringLiteral("在线检测完成，可升级应用数: %1 / %2")
@@ -433,9 +459,18 @@ void UpdateDialog::runUpgradePhase(const QList<int> &selectedIndexes)
                 [&](int installPct) {
                     m_upgradeProgress->setValue(baseProgress + (qBound(0, installPct, 100) * 30) / 100);
                     QApplication::processEvents();
+                },
+                // 取消检测
+                [this]() {
+                    return m_canceled;
                 });
 
             if (!depOk) {
+                if (m_canceled) {
+                    emitLog(QStringLiteral("[%1] 依赖修复已取消").arg(app.name));
+                    wasCanceled = true;
+                    break;
+                }
                 emitLog(QStringLiteral("[%1] 依赖修复失败：%2").arg(app.name, depResult));
 
                 const int ret = QMessageBox::question(
@@ -489,10 +524,19 @@ void UpdateDialog::runUpgradePhase(const QList<int> &selectedIndexes)
                 const int p = qBound(0, installPct, 100);
                 m_upgradeProgress->setValue(baseProgress + 70 + (p * 30) / 100);
                 QApplication::processEvents();
+            },
+            [this]() {
+                return m_canceled;
             });
 
         m_upgradeProgress->setValue((i + 1) * 100);
         QApplication::processEvents();
+
+        if (m_canceled) {
+            emitLog(QStringLiteral("[%1] 升级已取消").arg(app.name));
+            wasCanceled = true;
+            break;
+        }
 
         if (ok) {
             ++m_upgradeSuccessCount;

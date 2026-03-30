@@ -4,7 +4,7 @@
 ; 应用显示名称（安装向导、开始菜单、卸载信息中会显示）
 #define MyAppName "AppManager"
 ; 应用版本号（用于安装包版本与升级判断）
-#define MyAppVersion "1.0.3.0"
+#define MyAppVersion "1.0.3.13"
 
 ; 发布者名称（控制面板卸载列表中的发布者）
 #define MyAppPublisher "Kgooer"
@@ -74,8 +74,29 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 ; 安装完成后运行主程序
 ; nowait: 不等待程序退出
 ; postinstall: 仅在安装向导最后一步显示
-; skipifsilent: 静默安装时跳过自动启动
-Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; skipifsilent: 静默安装时跳过自动启动 skipifsilent
+; runasoriginaluser: 以当前登录用户身份启动，避免以管理员上下文运行导致行为异常
+Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; WorkingDir: "{app}"; Flags: nowait postinstall runasoriginaluser
+
+[UninstallDelete]
+; 递归删除安装目录下所有文件和子目录（包含运行时写入的配置、日志、应用文件等）
+Type: filesandordirs; Name: "{app}"
+
+[Code]
+// 卸载完成后，若安装目录仍存在（可能残留空目录）则强制移除
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    if DirExists(ExpandConstant('{app}')) then
+      DelTree(ExpandConstant('{app}'), True, True, True);
+    // 清除保存在注册表中的登录凭据
+    RegDeleteValue(HKCU, 'Software\AppManager\AppManager', 'authToken');
+    RegDeleteValue(HKCU, 'Software\AppManager\AppManager', 'authUser');
+  end;
+end;
+
+
 
 
 

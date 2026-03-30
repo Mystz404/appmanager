@@ -1,5 +1,13 @@
 ﻿<RCC>
     <qresource prefix="/resources">
         <file alias="appmanager.png">resources/appmanager.png</file>
+        <file alias="laucher.ico">resources/laucher.ico</file>
+        <file alias="community.ico">resources/community.ico</file>
+        <file alias="document.ico">resources/document.ico</file>
+        <file alias="log.ico">resources/log.ico</file>
+        <file alias="login.ico">resources/login.ico</file>
+        <file alias="logout.ico">resources/logout.ico</file>
+        <file alias="refresh.ico">resources/refresh.ico</file>
+        <file alias="array.gif">resources/array.gif</file>
     </qresource>
 </RCC>

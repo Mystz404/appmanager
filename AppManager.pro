@@ -5,7 +5,7 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 CONFIG += c++17
 
 win32: LIBS += -lversion
-VERSION = 1.0.3.0
+VERSION = 1.0.3.13
 win32: RC_ICONS += resources/appmanager.ico
 
 DEFINES += APP_VERSION=\\\"$${VERSION}\\\"
@@ -20,16 +20,20 @@ RCC_DIR = rcc_build
 
 SOURCES += \
     appmanagerservice.cpp \
+    docbrowserpage.cpp \
+    logindialog.cpp \
     main.cpp \
     mainwindow.cpp \
-    updatedialog.cpp \
     versionutils.cpp
 
 HEADERS += \
     appmanagerservice.h \
     apptypes.h \
+    docclienttypes.h \
+    docbrowserpage.h \
+    logindialog.h \
     mainwindow.h \
-    updatedialog.h \
+    refreshbuttonutils.h \
     versionutils.h
 
 FORMS += \

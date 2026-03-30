@@ -2,6 +2,7 @@
 #define APPMANAGERSERVICE_H
 
 #include "apptypes.h"
+#include "docclienttypes.h"
 
 #include <functional>
 #include <QHash>
@@ -28,6 +29,7 @@ public:
     using DownloadProgressCallback = std::function<void(qint64 receivedBytes, qint64 totalBytes)>;
     using StatusCallback = std::function<void(const QString &status)>;
     using InstallProgressCallback = std::function<void(int percent)>;
+    using CancelCallback = std::function<bool()>;
 
     explicit AppManagerService(QObject *parent = nullptr);
 
@@ -42,10 +44,15 @@ public:
 
     bool checkRequiredFiles(const AppConfig &app, QStringList &missingFiles) const;
 
+    /** 返回缺失的依赖文件列表（不含主 EXE，仅 requiredFiles 中未存在的条目）。 */
+    QStringList missingRequiredDeps(const AppConfig &app) const;
+
     /**
      * @brief 在线检查一个应用是否有更新。
      */
-    OnlineAppInfo checkOnlineInfo(const AppConfig &app, int timeoutMs = 10000);
+    OnlineAppInfo checkOnlineInfo(const AppConfig &app,
+                                  int timeoutMs = 20000,
+                                  const CancelCallback &cancelCallback = CancelCallback());
 
     /**
      * @brief 升级指定应用。
@@ -60,7 +67,8 @@ public:
                     int timeoutMs = 30000,
                     const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
                     const StatusCallback &statusCallback = StatusCallback(),
-                    const InstallProgressCallback &installProgressCallback = InstallProgressCallback());
+                    const InstallProgressCallback &installProgressCallback = InstallProgressCallback(),
+                    const CancelCallback &cancelCallback = CancelCallback());
 
     /**
      * @brief 检查依赖文件完整性，不完整时下载并解压完整包。
@@ -72,7 +80,8 @@ public:
                                  int timeoutMs = 180000,
                                  const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
                                  const StatusCallback &statusCallback = StatusCallback(),
-                                 const InstallProgressCallback &installProgressCallback = InstallProgressCallback());
+                                 const InstallProgressCallback &installProgressCallback = InstallProgressCallback(),
+                                 const CancelCallback &cancelCallback = CancelCallback());
 
     /// 获取服务器基础 URL
     QString serverBaseUrl() const;
@@ -80,11 +89,15 @@ public:
     /// 尝试连接服务器
     bool tryConnectServer(int timeoutMs = 3000);
 
-    /// 从服务器获取应用清单
-    QJsonArray fetchAppCatalog(int timeoutMs = 10000);
+    /// 从服务器获取应用清单（authToken 非空时携带 Authorization 头）
+    QJsonArray fetchAppCatalog(const QString &authToken = QString(),
+                               int timeoutMs = 10000,
+                               const CancelCallback &cancelCallback = CancelCallback());
 
     /// 获取某个应用的历史版本列表
-    QJsonObject fetchHistoryVersions(const QString &appId, int timeoutMs = 10000);
+    QJsonObject fetchHistoryVersions(const QString &appId,
+                                     int timeoutMs = 10000,
+                                     const CancelCallback &cancelCallback = CancelCallback());
 
     /// 下载文件到指定路径
     bool downloadToFile(const QUrl &url,
@@ -92,7 +105,8 @@ public:
                         QString &errorMessage,
                         int timeoutMs = 30000,
                         const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
-                        const StatusCallback &statusCallback = StatusCallback());
+                        const StatusCallback &statusCallback = StatusCallback(),
+                        const CancelCallback &cancelCallback = CancelCallback());
 
     /// 添加应用条目
     void addAppEntry(const AppConfig &app);
@@ -121,17 +135,45 @@ public:
                           const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
                           const StatusCallback &statusCallback = StatusCallback());
 
+    // ==================== 文档管理支持 ====================
+
+    /// 从服务器获取文档目录（/docs/catalog）
+    QVector<ClientDocEntry> fetchDocCatalog(int timeoutMs = 15000,
+                                             const CancelCallback &cancelCallback = CancelCallback());
+
+    /// 本地文档缓存目录（exe同级 docs/{docId}/）
+    QString localDocCacheDir() const;
+
+    /// 某文档的本地缓存路径
+    QString localDocFilePath(const ClientDocEntry &doc) const;
+
+    /// 文档文件是否已下载到本地
+    bool isDocDownloaded(const ClientDocEntry &doc) const;
+
+    /// 本地文档文件的 SHA256 是否与服务器一致（用于检测更新）
+    bool isDocUpToDate(const ClientDocEntry &doc) const;
+
+    /// 下载文档到本地缓存目录（可带进度回调）
+    bool downloadDoc(const ClientDocEntry &doc,
+                     QString &errorMessage,
+                     int timeoutMs = 60000,
+                     const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                     const CancelCallback &cancelCallback = CancelCallback());
+
 private:
     QByteArray httpGet(const QUrl &url,
                        QString &errorMessage,
                        int timeoutMs,
-                       const DownloadProgressCallback &progressCallback = DownloadProgressCallback()) const;
+                       const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
+                       const CancelCallback &cancelCallback = CancelCallback(),
+                       const QByteArray &authToken = QByteArray()) const;
     bool downloadFileWithResume(const QUrl &url,
                                 const QString &targetFilePath,
                                 QString &errorMessage,
                                 int timeoutMs,
                                 const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
-                                const StatusCallback &statusCallback = StatusCallback()) const;
+                                const StatusCallback &statusCallback = StatusCallback(),
+                                const CancelCallback &cancelCallback = CancelCallback()) const;
     QStringList loadZipReplaceFileList(QString &errorMessage) const;
     QString resolvePath(const QString &relativePath) const;
     bool upgradeByExeReplace(const AppConfig &app,
@@ -149,6 +191,7 @@ private:
 
 private:
     QString m_configPath;
+    QString m_appListPath;
     QString m_appsRootRaw;
     QString m_appsRoot;
     QString m_serverBaseUrl;
