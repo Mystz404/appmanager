@@ -33,6 +33,49 @@ public:
     explicit DocItemDelegate(QObject *parent = nullptr)
         : QStyledItemDelegate(parent) {}
 
+    struct DocTypeColor {
+        QColor bg;      // 卡片背景（浅色）
+        QColor border;  // 描边（略深）
+        QColor hoverBg; // 悬停背景
+        QColor selBg;   // 选中背景
+        QColor selBorder;// 选中描边
+        QColor iconBg;  // 图标背景
+        QColor iconLine; // 图标线条
+    };
+
+    static DocTypeColor colorForExt(const QString &ext)
+    {
+        const QString e = ext.toLower();
+        if (e == QStringLiteral("pdf"))
+            return { QColor(254,242,242), QColor(252,165,165), QColor(254,226,226),
+                     QColor(254,202,202), QColor(239,68,68),
+                     QColor(254,226,226), QColor(239,68,68) };
+        if (e == QStringLiteral("doc") || e == QStringLiteral("docx"))
+            return { QColor(239,246,255), QColor(147,197,253), QColor(219,234,254),
+                     QColor(191,219,254), QColor(59,130,246),
+                     QColor(219,234,254), QColor(59,130,246) };
+        if (e == QStringLiteral("xls") || e == QStringLiteral("xlsx"))
+            return { QColor(236,253,245), QColor(134,239,172), QColor(220,252,231),
+                     QColor(187,247,208), QColor(34,197,94),
+                     QColor(220,252,231), QColor(34,197,94) };
+        if (e == QStringLiteral("ppt") || e == QStringLiteral("pptx"))
+            return { QColor(255,247,237), QColor(253,186,116), QColor(254,243,199),
+                     QColor(253,230,138), QColor(245,158,11),
+                     QColor(254,243,199), QColor(245,158,11) };
+        if (e == QStringLiteral("txt") || e == QStringLiteral("md"))
+            return { QColor(249,250,251), QColor(209,213,219), QColor(243,244,246),
+                     QColor(229,231,235), QColor(107,114,128),
+                     QColor(243,244,246), QColor(107,114,128) };
+        if (e == QStringLiteral("zip") || e == QStringLiteral("rar") || e == QStringLiteral("7z"))
+            return { QColor(250,245,255), QColor(196,181,253), QColor(243,232,255),
+                     QColor(233,213,255), QColor(139,92,246),
+                     QColor(243,232,255), QColor(139,92,246) };
+        // 默认：青色系
+        return { QColor(236,254,255), QColor(165,243,252), QColor(207,250,254),
+                 QColor(165,243,252), QColor(6,182,212),
+                 QColor(207,250,254), QColor(6,182,212) };
+    }
+
     QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &) const override
     {
         return QSize(220, 90);
@@ -54,11 +97,14 @@ public:
         const bool hovered  = (option.state & QStyle::State_MouseOver) != 0;
         const bool selected = (option.state & QStyle::State_Selected) != 0;
 
-        // 卡片背景
-        const QColor bg = selected ? QColor(219, 234, 254)
-                        : (hovered ? QColor(239, 246, 255) : Qt::white);
-        const QColor border = selected ? QColor(59, 130, 246)
-                             : (hovered ? QColor(147, 197, 253) : QColor(226, 232, 240));
+        // 根据文档类型确定卡片颜色
+        const QString docExt = index.data(Qt::UserRole + 13).toString();
+        const DocTypeColor tc = colorForExt(docExt);
+
+        const QColor bg = selected ? tc.selBg
+                        : (hovered ? tc.hoverBg : tc.bg);
+        const QColor border = selected ? tc.selBorder
+                             : (hovered ? tc.border : tc.border.lighter(120));
         painter->setPen(QPen(border, 1.5));
         painter->setBrush(bg);
         painter->drawRoundedRect(r, 8, 8);
@@ -70,12 +116,12 @@ public:
         const QString badge = index.data(Qt::UserRole + 12).toString();
 
         if (badge == QStringLiteral("下载")) {
-            // 未下载状态：显示下载图标
+            // 未下载状态：显示下载图标（使用类型对应色调）
             painter->setPen(Qt::NoPen);
-            painter->setBrush(QColor(239, 246, 255)); // 极淡蓝底
+            painter->setBrush(tc.iconBg);
             painter->drawRoundedRect(iconRect, 6, 6);
             
-            painter->setPen(QPen(QColor(59, 130, 246), 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            painter->setPen(QPen(tc.iconLine, 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
             int cx = iconRect.center().x();
             int cy = iconRect.center().y();
             // 向下箭头
@@ -85,10 +131,10 @@ public:
             // 底部横线
             painter->drawLine(cx - 6, cy + 8, cx + 6, cy + 8);
         } else {
-            // 已下载或有更新：显示文档图标（浅绿色风格）
+            // 已下载或有更新：显示文档图标（使用类型对应色调）
             QRect docR = iconRect.adjusted(3, 2, -3, -2);
-            painter->setPen(QPen(QColor(167, 243, 208), 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-            painter->setBrush(QColor(236, 253, 245)); // 极淡绿底
+            painter->setPen(QPen(tc.border, 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            painter->setBrush(tc.iconBg);
             
             QPainterPath path;
             path.moveTo(docR.left(), docR.top());
@@ -102,7 +148,7 @@ public:
             painter->drawLine(docR.right() - 8, docR.top(), docR.right() - 8, docR.top() + 8);
             painter->drawLine(docR.right() - 8, docR.top() + 8, docR.right(), docR.top() + 8);
             
-            painter->setPen(QPen(QColor(16, 185, 129), 1.5, Qt::SolidLine, Qt::RoundCap));
+            painter->setPen(QPen(tc.iconLine, 1.5, Qt::SolidLine, Qt::RoundCap));
             painter->drawLine(docR.left() + 6, docR.top() + 14, docR.right() - 6, docR.top() + 14);
             painter->drawLine(docR.left() + 6, docR.top() + 20, docR.right() - 6, docR.top() + 20);
             painter->drawLine(docR.left() + 6, docR.top() + 26, docR.right() - 10, docR.top() + 26);
@@ -110,23 +156,39 @@ public:
 
         // 标题 (完全显示，部分居中对齐，多行处理)
         const QString title = index.data(Qt::DisplayRole).toString();
-        const QRect nameRect(r.left() + 58, r.top() + 8, r.width() - 92, 48);
+        const QRect nameRect(r.left() + 58, r.top() + 8, r.width() - 92, 40);
         {
             QFont nf;
             nf.setPixelSize(13);
             nf.setBold(true);
             painter->setFont(nf);
             painter->setPen(selected ? QColor(30, 58, 138) : QColor(31, 41, 55));
-            // Qt::AlignVCenter | Qt::AlignLeft 可以让单行垂直居中，多行也会尽量居中
             painter->drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWrapAnywhere, title);
+        }
+
+        // 文档类型标签
+        if (!docExt.isEmpty()) {
+            const QString extLabel = docExt.toUpper();
+            QFont ef;
+            ef.setPixelSize(10);
+            ef.setBold(true);
+            painter->setFont(ef);
+            QFontMetrics efm(ef);
+            const int tw = efm.horizontalAdvance(extLabel) + 8;
+            const QRect extRect(r.left() + 58, r.bottom() - 34, tw, 14);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(tc.border);
+            painter->drawRoundedRect(extRect, 3, 3);
+            painter->setPen(Qt::white);
+            painter->drawText(extRect, Qt::AlignCenter, extLabel);
         }
 
         // 版本信息
         const QString version = index.data(Qt::UserRole + 11).toString();
-        const QRect vRect(r.left() + 58, r.bottom() - 24, r.width() - 96, 20);
+        const QRect vRect(r.left() + 58, r.bottom() - 20, r.width() - 96, 16);
         if (!version.isEmpty()) {
             QFont vf;
-            vf.setPixelSize(12);
+            vf.setPixelSize(11);
             painter->setFont(vf);
             painter->setPen(QColor(107, 114, 128));
             painter->drawText(vRect, Qt::AlignLeft | Qt::AlignVCenter, version);
@@ -335,6 +397,29 @@ void DocBrowserPage::buildUi()
         "  font-weight: bold;"
         "}"));
     catLay->addWidget(m_btnAll);
+
+    // "已下载" 过滤按鈕
+    m_btnDownloaded = new QToolButton(m_catBar);
+    m_btnDownloaded->setText(QStringLiteral("  已下载  "));
+    m_btnDownloaded->setCheckable(true);
+    m_btnDownloaded->setCursor(Qt::PointingHandCursor);
+    m_btnDownloaded->setStyleSheet(QStringLiteral(
+        "QToolButton {"
+        "  background: #f1f5f9;"
+        "  color: #475569;"
+        "  border: none;"
+        "  border-radius: 12px;"
+        "  padding: 4px 14px;"
+        "  font-size: 13px;"
+        "  font-weight: normal;"
+        "}"
+        "QToolButton:hover { background: #dcfce7; color: #15803d; }"
+        "QToolButton:checked {"
+        "  background: #dcfce7;"
+        "  color: #15803d;"
+        "  font-weight: bold;"
+        "}"));
+    catLay->addWidget(m_btnDownloaded);
     catLay->addStretch();
 
     m_catScroll->setWidget(m_catBar);
@@ -362,8 +447,21 @@ void DocBrowserPage::buildUi()
     connect(m_btnRefresh, &QPushButton::clicked, this, &DocBrowserPage::refresh);
     connect(m_btnAll, &QToolButton::clicked, this, [this]() {
         m_activeCategory.clear();
-        m_searchBox->clear();  // 切分类时清空搜索
+        m_showDownloadedOnly = false;
+        m_searchBox->clear();
         m_btnAll->setChecked(true);
+        m_btnDownloaded->setChecked(false);
+        for (auto it = m_catButtons.constBegin(); it != m_catButtons.constEnd(); ++it) {
+            it.value()->setChecked(false);
+        }
+        refreshDocGrid();
+    });
+    connect(m_btnDownloaded, &QToolButton::clicked, this, [this]() {
+        m_activeCategory.clear();
+        m_showDownloadedOnly = true;
+        m_searchBox->clear();
+        m_btnAll->setChecked(false);
+        m_btnDownloaded->setChecked(true);
         for (auto it = m_catButtons.constBegin(); it != m_catButtons.constEnd(); ++it) {
             it.value()->setChecked(false);
         }
@@ -457,8 +555,10 @@ void DocBrowserPage::rebuildCategoryFilter()
 
         connect(btn, &QToolButton::clicked, this, [this, cat]() {
             m_activeCategory = cat;
+            m_showDownloadedOnly = false;
             m_searchBox->clear();  // 切分类时清空搜索
             m_btnAll->setChecked(false);
+            m_btnDownloaded->setChecked(false);
             for (auto it = m_catButtons.constBegin(); it != m_catButtons.constEnd(); ++it) {
                 it.value()->setChecked(it.key() == cat);
             }
@@ -467,7 +567,8 @@ void DocBrowserPage::rebuildCategoryFilter()
     }
     catLay->addStretch();
 
-    m_btnAll->setChecked(m_activeCategory.isEmpty());
+    m_btnAll->setChecked(m_activeCategory.isEmpty() && !m_showDownloadedOnly);
+    m_btnDownloaded->setChecked(m_showDownloadedOnly);
 }
 
 // ============================================================
@@ -491,6 +592,9 @@ void DocBrowserPage::refreshDocGrid()
                     if (k.toLower().contains(kw)) { matched = true; break; }
             }
             if (!matched) continue;
+        } else if (m_showDownloadedOnly) {
+            // 已下载过滤模式
+            if (!m_service->isDocDownloaded(doc)) continue;
         } else {
             // 分类过滤模式
             if (!m_activeCategory.isEmpty() && !doc.categories.contains(m_activeCategory))
@@ -509,6 +613,9 @@ void DocBrowserPage::refreshDocGrid()
         item->setData(Qt::UserRole + 10, doc.categories);
         item->setData(Qt::UserRole + 11, QStringLiteral("v%1").arg(doc.version));
         item->setData(Qt::UserRole + 12, badge);
+        // 文件后缀名（用于卡片着色和类型标签）
+        const int dotIdx = doc.fileName.lastIndexOf('.');
+        item->setData(Qt::UserRole + 13, dotIdx >= 0 ? doc.fileName.mid(dotIdx + 1) : QString());
         item->setTextAlignment(Qt::AlignHCenter);
         item->setToolTip(doc.description.isEmpty() ? doc.title : doc.description);
         m_docList->addItem(item);
@@ -536,6 +643,7 @@ void DocBrowserPage::onSearchTextChanged(const QString &text)
 
     // 搜索时取消分类选中激活态（分类按钮变灰暗，搜索优先）
     m_btnAll->setChecked(!isSearching);
+    m_btnDownloaded->setChecked(false);
     for (auto it = m_catButtons.constBegin(); it != m_catButtons.constEnd(); ++it)
         it.value()->setChecked(false);
 

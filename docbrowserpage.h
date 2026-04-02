@@ -52,6 +52,7 @@ protected:
     QVector<ClientDocEntry>  m_catalog;
     QString                  m_activeCategory;   // "" = 全部
     QString                  m_searchText;       // 模糊搜索关键词
+    bool                     m_showDownloadedOnly = false; // 仅显示已下载
 
     QScrollArea             *m_catScroll  = nullptr;
     QWidget                 *m_catBar     = nullptr;
@@ -63,7 +64,8 @@ protected:
     QProgressBar            *m_docDownloadProgress = nullptr;
 
     QHash<QString, QToolButton *> m_catButtons;
-    QToolButton                  *m_btnAll = nullptr;
+    QToolButton                  *m_btnAll        = nullptr;
+    QToolButton                  *m_btnDownloaded = nullptr;
 };
 
 #endif // DOCBROWSERPAGE_H

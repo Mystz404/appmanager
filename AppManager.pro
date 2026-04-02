@@ -5,7 +5,7 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 CONFIG += c++17
 
 win32: LIBS += -lversion
-VERSION = 1.0.3.13
+VERSION = 1.0.3.14
 win32: RC_ICONS += resources/appmanager.ico
 
 DEFINES += APP_VERSION=\\\"$${VERSION}\\\"

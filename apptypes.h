@@ -185,6 +185,11 @@ struct OnlineAppInfo
      * - 为空表示服务端未配置完整包。
      */
     QUrl fullPackageUrl;
+
+    /**
+     * @brief 当前版本更新说明。
+     */
+    QString changeLog;
 };
 
 /**

@@ -86,6 +86,9 @@ public:
     /// 获取服务器基础 URL
     QString serverBaseUrl() const;
 
+    /// 设置当前登录 token（登录/注销时由 MainWindow 调用，供文档目录等请求携带认证头）
+    void setAuthToken(const QString &token);
+
     /// 尝试连接服务器
     bool tryConnectServer(int timeoutMs = 3000);
 
@@ -195,6 +198,7 @@ private:
     QString m_appsRootRaw;
     QString m_appsRoot;
     QString m_serverBaseUrl;
+    QString m_authToken;
     QVector<AppConfig> m_apps;
 
     // QNAM 复用连接池，提升多个应用检查/下载时的效率。

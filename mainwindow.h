@@ -119,6 +119,9 @@ private:
     QHash<QString, OnlineAppInfo> m_onlineCache;
     QHash<QString, AppConfig> m_appById;
 
+    // AppManager 自身更新说明（从服务端获取）
+    QString m_appManagerChangeLog;
+
     // 服务器清单中本地不存在的应用
     QHash<QString, QJsonObject> m_remoteCatalog;
 

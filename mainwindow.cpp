@@ -1073,6 +1073,7 @@ void MainWindow::loadConfig()
     QSettings authSettings(QStringLiteral("Software\\AppManager\\AppManager"), QSettings::NativeFormat);
     m_authToken = authSettings.value(QStringLiteral("authToken")).toString();
     m_authUser  = authSettings.value(QStringLiteral("authUser")).toString();
+    m_service.setAuthToken(m_authToken);
     if (!m_authToken.isEmpty() && m_loginButton) {
         m_loginButton->setIcon(QIcon(QStringLiteral(":/resources/logout.ico")));
         m_loginButton->setText(m_authUser.isEmpty() ? QStringLiteral("已登录") : m_authUser);
@@ -1155,8 +1156,15 @@ void MainWindow::refreshAppIcons()
         item->setTextAlignment(Qt::AlignHCenter);
         item->setSizeHint(QSize(120, 160));
         if (hasUpdate) {
-            item->setToolTip(QStringLiteral("当前: V%1，最新: V%2")
-                                 .arg(currentVersion, online.latestVersion));
+            QString tip = QStringLiteral("当前: V%1，最新: V%2")
+                              .arg(currentVersion, online.latestVersion);
+            if (!online.changeLog.isEmpty()) {
+                tip += QStringLiteral("\n\n更新说明:\n%1").arg(online.changeLog);
+            }
+            item->setToolTip(tip);
+        } else if (online.requestSuccess && !online.changeLog.isEmpty()) {
+            item->setToolTip(QStringLiteral("V%1 更新说明:\n%2")
+                                 .arg(currentVersion, online.changeLog));
         } else {
             item->setToolTip(QDir::toNativeSeparators(exePath));
         }
@@ -1828,6 +1836,11 @@ void MainWindow::trySilentAppManagerAutoUpdate()
         return;
     }
 
+    // 保存更新说明供帮助页面使用
+    if (!online.changeLog.isEmpty()) {
+        m_appManagerChangeLog = online.changeLog;
+    }
+
     const QString currentVersion = m_service.appManagerVersion();
     const QString latestVersion = online.latestVersion;
     if (compareVersions(currentVersion, latestVersion) >= 0) {
@@ -2118,6 +2131,19 @@ void MainWindow::showAppContextMenu(const QString &appId, const QPoint &globalPo
             menu.addAction(QStringLiteral("升级到 V%1").arg(online.latestVersion), this, [this, appId]() {
                 const QVector<AppConfig> singleApp = { m_appById.value(appId) };
                 startUpdateWorkflow(singleApp);
+            });
+        }
+
+        // 有更新说明时显示查看选项
+        if (online.requestSuccess && !online.changeLog.isEmpty()) {
+            menu.addAction(QStringLiteral("查看更新说明"), this, [this, appId, online]() {
+                const AppConfig app2 = m_appById.value(appId);
+                showAdaptiveMessageBox(this,
+                                       QMessageBox::Information,
+                                       QStringLiteral("%1 - V%2 更新说明").arg(app2.name, online.latestVersion),
+                                       online.changeLog,
+                                       QMessageBox::Ok,
+                                       QMessageBox::Ok);
             });
         }
 
@@ -2425,7 +2451,7 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
     // 显示历史版本选择对话框
     QDialog dlg(this);
     dlg.setWindowTitle(QStringLiteral("历史版本 - %1").arg(app.name));
-    dlg.setFixedSize(640, 420);
+    dlg.setFixedSize(700, 520);
 
     auto *dlgLayout = new QVBoxLayout(&dlg);
     dlgLayout->setContentsMargins(18, 14, 18, 14);
@@ -2437,11 +2463,12 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
             .arg(m_service.appCurrentVersion(app)), &dlg);
     dlgLayout->addWidget(topLabel);
 
-    auto *table = new QTableWidget(versions.size(), 3, &dlg);
+    auto *table = new QTableWidget(versions.size(), 4, &dlg);
     table->setHorizontalHeaderLabels({
         QStringLiteral("版本号"),
         QStringLiteral("名称"),
-        QStringLiteral("状态")
+        QStringLiteral("状态"),
+        QStringLiteral("更新说明")
     });
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -2465,11 +2492,35 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
             statusItem->setForeground(QColor(22, 163, 74));
         }
         table->setItem(i, 2, statusItem);
+        // 更新说明（截断显示）
+        const QString changeLog = vo.value(QStringLiteral("changeLog")).toString();
+        const QString logPreview = changeLog.length() > 30
+            ? changeLog.left(30) + QStringLiteral("...")
+            : changeLog;
+        auto *logItem = new QTableWidgetItem(logPreview);
+        logItem->setToolTip(changeLog);
+        table->setItem(i, 3, logItem);
         table->item(i, 0)->setData(Qt::UserRole, versions.at(row));
         table->item(i, 0)->setData(Qt::UserRole + 1, alreadyDl);
     }
     table->resizeColumnsToContents();
     dlgLayout->addWidget(table);
+
+    // 版本更新说明详情区域
+    auto *lblLogTitle = new QLabel(QStringLiteral("版本更新说明："), &dlg);
+    lblLogTitle->setStyleSheet(QStringLiteral("font-weight: bold; margin-top: 4px;"));
+    dlgLayout->addWidget(lblLogTitle);
+
+    auto *lblLogDetail = new QLabel(&dlg);
+    lblLogDetail->setWordWrap(true);
+    lblLogDetail->setTextFormat(Qt::PlainText);
+    lblLogDetail->setMinimumHeight(50);
+    lblLogDetail->setMaximumHeight(80);
+    lblLogDetail->setStyleSheet(QStringLiteral(
+        "background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px; "
+        "padding: 6px 8px; color: #374151; font-size: 12px;"));
+    lblLogDetail->setText(QStringLiteral("（选择一个版本查看更新说明）"));
+    dlgLayout->addWidget(lblLogDetail);
 
     auto *hint = new QLabel(QStringLiteral("点击下载历史版本，多版本可共存。"), &dlg);
     hint->setStyleSheet(QStringLiteral("color: #6b7280; font-size: 12px;"));
@@ -2479,9 +2530,18 @@ void MainWindow::onDownloadHistoryVersion(const QString &appId)
     auto *btnDl = btnBox->addButton(QStringLiteral("下载"), QDialogButtonBox::AcceptRole);
     btnDl->setEnabled(false);
     btnBox->addButton(QDialogButtonBox::Cancel);
-    connect(table, &QTableWidget::itemSelectionChanged, [table, btnDl]() {
+    connect(table, &QTableWidget::itemSelectionChanged, [table, btnDl, lblLogDetail]() {
         const int row = table->currentRow();
         btnDl->setEnabled(row >= 0 && table->item(row, 0));
+        if (row >= 0 && table->item(row, 0)) {
+            const QJsonObject vo = table->item(row, 0)->data(Qt::UserRole).toJsonObject();
+            const QString log = vo.value(QStringLiteral("changeLog")).toString().trimmed();
+            lblLogDetail->setText(log.isEmpty()
+                ? QStringLiteral("（该版本暂无更新说明）")
+                : log);
+        } else {
+            lblLogDetail->setText(QStringLiteral("（选择一个版本查看更新说明）"));
+        }
     });
     connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -2880,6 +2940,11 @@ void MainWindow::onCheckAppManagerUpdate()
         return;
     }
 
+    // 保存更新说明供帮助页面使用
+    if (!online.changeLog.isEmpty()) {
+        m_appManagerChangeLog = online.changeLog;
+    }
+
     const QString currentVersion = m_service.appManagerVersion();
     const QString latestVersion = online.latestVersion;
     
@@ -2896,12 +2961,18 @@ void MainWindow::onCheckAppManagerUpdate()
     }
 
     // 提示用户升级
+    QString updateMsg = QStringLiteral("发现 AppManager 新版本 v%1\n\n当前版本: v%2")
+                            .arg(latestVersion, currentVersion);
+    if (!online.changeLog.isEmpty()) {
+        updateMsg += QStringLiteral("\n\n更新说明:\n%1").arg(online.changeLog);
+    }
+    updateMsg += QStringLiteral("\n\n是否立即升级?");
+
     QMessageBox::StandardButton ret = showAdaptiveMessageBox(
         this,
         QMessageBox::Question,
         QStringLiteral("发现新版本"),
-        QStringLiteral("发现 AppManager 新版本 v%1\n\n当前版本: v%2\n\n是否立即升级?")
-            .arg(latestVersion, currentVersion),
+        updateMsg,
         QMessageBox::Yes | QMessageBox::No,
         QMessageBox::Yes);
 
@@ -2959,12 +3030,15 @@ void MainWindow::onCheckAppManagerUpdate()
 void MainWindow::onAboutAppManager()
 {
     const QString appVersion = m_service.appManagerVersion();
-    QMessageBox::about(this, QStringLiteral("关于 AppManager"),
-                       QStringLiteral("AppManager v%1\n\n"
-                                      "应用管理和升级工具\n\n"
-                                      "© 2024-2025\n\n"
-                                      "点击菜单中的'检查更新'可查询新版本")
-                           .arg(appVersion));
+    QString aboutText = QStringLiteral("AppManager v%1\n\n"
+                                       "应用管理和升级工具\n\n"
+                                       "© 2024-2025\n\n"
+                                       "点击菜单中的'检查更新'可查询新版本")
+                            .arg(appVersion);
+    if (!m_appManagerChangeLog.isEmpty()) {
+        aboutText += QStringLiteral("\n\n── 当前版本更新说明 ──\n%1").arg(m_appManagerChangeLog);
+    }
+    QMessageBox::about(this, QStringLiteral("关于 AppManager"), aboutText);
 }
 void MainWindow::onLoginClicked()
 {
@@ -2981,6 +3055,7 @@ void MainWindow::onLoginClicked()
 
     m_authToken = dlg.token();
     m_authUser  = dlg.username();
+    m_service.setAuthToken(m_authToken);
 
     QSettings settings(QStringLiteral("Software\\AppManager\\AppManager"), QSettings::NativeFormat);
     settings.setValue(QStringLiteral("authToken"), m_authToken);
@@ -3001,6 +3076,7 @@ void MainWindow::onLogoutClicked()
 {
     m_authToken.clear();
     m_authUser.clear();
+    m_service.setAuthToken(QString());
     QSettings settings(QStringLiteral("Software\\AppManager\\AppManager"), QSettings::NativeFormat);
     settings.remove(QStringLiteral("authToken"));
     settings.remove(QStringLiteral("authUser"));

@@ -704,6 +704,9 @@ OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app,
                                                        m_serverBaseUrl);
     }
 
+    // 解析当前版本更新说明
+    info.changeLog = obj.value(QStringLiteral("changeLog")).toString().trimmed();
+
     if (info.packageType.isEmpty()) {
         info.packageType = QStringLiteral("exe");
     }
@@ -1776,6 +1779,11 @@ QString AppManagerService::serverBaseUrl() const
     return m_serverBaseUrl;
 }
 
+void AppManagerService::setAuthToken(const QString &token)
+{
+    m_authToken = token;
+}
+
 bool AppManagerService::tryConnectServer(int timeoutMs)
 {
     if (m_serverBaseUrl.isEmpty()) {
@@ -1999,6 +2007,8 @@ OnlineAppInfo AppManagerService::checkAppManagerUpdate(int timeoutMs)
         result.errorMessage = QStringLiteral("AppManager 更新元数据缺少 latestVersion 或 downloadUrl");
         return result;
     }
+
+    result.changeLog = obj.value(QStringLiteral("changeLog")).toString().trimmed();
     
     result.requestSuccess = true;
     return result;
@@ -2068,7 +2078,8 @@ QVector<ClientDocEntry> AppManagerService::fetchDocCatalog(int timeoutMs,
 
     const QString url = m_serverBaseUrl + QStringLiteral("/docs/catalog");
     QString err;
-    const QByteArray response = httpGet(QUrl(url), err, timeoutMs, {}, cancelCallback);
+    const QByteArray response = httpGet(QUrl(url), err, timeoutMs, {}, cancelCallback,
+                                        m_authToken.toUtf8());
     if (response.isEmpty()) return {};
 
     QJsonParseError parseError;

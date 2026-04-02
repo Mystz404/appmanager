@@ -4,7 +4,7 @@
 ; 应用显示名称（安装向导、开始菜单、卸载信息中会显示）
 #define MyAppName "AppManager"
 ; 应用版本号（用于安装包版本与升级判断）
-#define MyAppVersion "1.0.3.13"
+#define MyAppVersion "1.0.3.14"
 
 ; 发布者名称（控制面板卸载列表中的发布者）
 #define MyAppPublisher "Kgooer"
@@ -28,8 +28,6 @@ VersionInfoVersion={#MyAppVersion}
 VersionInfoProductVersion={#MyAppVersion}
 ; 发布者（引用上面的宏）
 AppPublisher={#MyAppPublisher}
-; 默认安装目录（autopf=Program Files）
-DefaultDirName={autopf}\{#MyAppName}
 ; 开始菜单程序组名称
 DefaultGroupName={#MyAppName}
 ; 输出目录（生成安装包的位置）
@@ -44,6 +42,8 @@ SolidCompression=yes
 WizardStyle=modern
 ; 在 64 位系统上默认安装到 64 位目录（x64compatible 适配 x64）
 ArchitecturesInstallIn64BitMode=x64compatible
+; 默认安装目录
+DefaultDirName={userappdata}\AppManager
 ; 安装所需权限（admin 表示需要管理员权限）
 PrivilegesRequired=admin
 ; 卸载条目显示图标（控制面板中展示的图标路径）
@@ -56,7 +56,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:chinesesimplified.isl"
 [Tasks]
 ; 可选任务：创建桌面快捷方式
 ; unchecked 表示默认不勾选
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: checkablealone
 
 [Files]
 ; 将源目录下所有文件递归复制到安装目录
