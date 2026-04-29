@@ -68,7 +68,8 @@ public:
                     const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
                     const StatusCallback &statusCallback = StatusCallback(),
                     const InstallProgressCallback &installProgressCallback = InstallProgressCallback(),
-                    const CancelCallback &cancelCallback = CancelCallback());
+                    const CancelCallback &cancelCallback = CancelCallback(),
+                    bool forceRedownload = false);
 
     /**
      * @brief 检查依赖文件完整性，不完整时下载并解压完整包。
@@ -81,7 +82,8 @@ public:
                                  const DownloadProgressCallback &progressCallback = DownloadProgressCallback(),
                                  const StatusCallback &statusCallback = StatusCallback(),
                                  const InstallProgressCallback &installProgressCallback = InstallProgressCallback(),
-                                 const CancelCallback &cancelCallback = CancelCallback());
+                                 const CancelCallback &cancelCallback = CancelCallback(),
+                                 bool forceRedownload = false);
 
     /// 获取服务器基础 URL
     QString serverBaseUrl() const;

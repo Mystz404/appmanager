@@ -25,6 +25,75 @@
 #include <QVBoxLayout>
 
 // ============================================================
+// FlowLayout — 自动换行流式布局
+// ============================================================
+class FlowLayout : public QLayout
+{
+public:
+    explicit FlowLayout(QWidget *parent, int margin = -1, int hSpacing = -1, int vSpacing = -1)
+        : QLayout(parent), m_hSpace(hSpacing), m_vSpace(vSpacing)
+    {
+        if (margin >= 0) setContentsMargins(margin, margin, margin, margin);
+    }
+    explicit FlowLayout(int margin = -1, int hSpacing = -1, int vSpacing = -1)
+        : m_hSpace(hSpacing), m_vSpace(vSpacing)
+    {
+        if (margin >= 0) setContentsMargins(margin, margin, margin, margin);
+    }
+    ~FlowLayout() override { while (QLayoutItem *item = takeAt(0)) delete item; }
+
+    void addItem(QLayoutItem *item) override { m_items.append(item); }
+    int count() const override { return m_items.size(); }
+    QLayoutItem *itemAt(int i) const override { return m_items.value(i); }
+    QLayoutItem *takeAt(int i) override
+    {
+        return (i >= 0 && i < m_items.size()) ? m_items.takeAt(i) : nullptr;
+    }
+
+    Qt::Orientations expandingDirections() const override { return {}; }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int width) const override { return doLayout(QRect(0, 0, width, 0), true); }
+
+    QSize minimumSize() const override
+    {
+        QSize s;
+        for (const QLayoutItem *item : m_items)
+            s = s.expandedTo(item->minimumSize());
+        const QMargins m = contentsMargins();
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom());
+    }
+    QSize sizeHint() const override { return minimumSize(); }
+    void setGeometry(const QRect &rect) override { QLayout::setGeometry(rect); doLayout(rect, false); }
+
+private:
+    int doLayout(const QRect &rect, bool testOnly) const
+    {
+        const QMargins cm = contentsMargins();
+        const QRect eff = rect.adjusted(cm.left(), cm.top(), -cm.right(), -cm.bottom());
+        int x = eff.x(), y = eff.y();
+        int lineHeight = 0;
+        const int hSp = (m_hSpace >= 0) ? m_hSpace : 6;
+        const int vSp = (m_vSpace >= 0) ? m_vSpace : 6;
+        for (QLayoutItem *item : m_items) {
+            const QSize sz = item->sizeHint();
+            if (x + sz.width() > eff.right() + 1 && lineHeight > 0) {
+                x = eff.x();
+                y += lineHeight + vSp;
+                lineHeight = 0;
+            }
+            if (!testOnly)
+                item->setGeometry(QRect(QPoint(x, y), sz));
+            x += sz.width() + hSp;
+            lineHeight = qMax(lineHeight, sz.height());
+        }
+        return y + lineHeight - rect.y() + cm.bottom();
+    }
+    int m_hSpace;
+    int m_vSpace;
+    QList<QLayoutItem *> m_items;
+};
+
+// ============================================================
 // 文档卡片代理（仿 AppItemDelegate 风格）
 // ============================================================
 class DocItemDelegate : public QStyledItemDelegate
@@ -278,8 +347,9 @@ void DocBrowserPage::buildUi()
     separator->setFixedHeight(14);
     separator->setStyleSheet(QStringLiteral("background: #e2e8f0; border: none;"));
 
-    // 状态标签（动态更新）
+    // 状态标签（动态更新，支持自动换行）
     m_lblStatus = new QLabel(QStringLiteral("\u52a0\u8f7d\u6587\u6863\u5217\u8868\u4e2d\u2026"), topBar);
+    m_lblStatus->setWordWrap(true);
     m_lblStatus->setStyleSheet(QStringLiteral(
         "color: #6b7280; font-size: 12px; background: transparent;"));
 
@@ -356,23 +426,11 @@ void DocBrowserPage::buildUi()
     topBarVLay->addWidget(m_docDownloadProgress);
     vlay->addWidget(topBar);
 
-    // ---- 分类过滤栏 ----
-    m_catScroll = new QScrollArea(this);
-    m_catScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-    m_catScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_catScroll->setWidgetResizable(true);
-    m_catScroll->setFixedHeight(48);
-    m_catScroll->setFrameShape(QFrame::NoFrame);
-    m_catScroll->setStyleSheet(QStringLiteral(
-        "QScrollArea { background: transparent; }"
-        "QScrollBar:horizontal { height: 4px; background: #f1f5f9; }"
-        "QScrollBar::handle:horizontal { background: #cbd5e1; border-radius: 2px; }"));
-
-    m_catBar = new QWidget;
+    // ---- 分类过滤栏（多排换行） ----
+    m_catBar = new QWidget(this);
     m_catBar->setStyleSheet(QStringLiteral("background: transparent;"));
-    auto *catLay = new QHBoxLayout(m_catBar);
+    auto *catLay = new FlowLayout(m_catBar, -1, 6, 6);
     catLay->setContentsMargins(0, 4, 0, 4);
-    catLay->setSpacing(6);
 
     // "全部" 按钮
     m_btnAll = new QToolButton(m_catBar);
@@ -420,10 +478,8 @@ void DocBrowserPage::buildUi()
         "  font-weight: bold;"
         "}"));
     catLay->addWidget(m_btnDownloaded);
-    catLay->addStretch();
 
-    m_catScroll->setWidget(m_catBar);
-    vlay->addWidget(m_catScroll);
+    vlay->addWidget(m_catBar);
 
     // ---- 文档网格 ----
     m_docList = new QListWidget(this);
@@ -519,12 +575,7 @@ void DocBrowserPage::rebuildCategoryFilter()
     for (auto *btn : m_catButtons) btn->deleteLater();
     m_catButtons.clear();
 
-    auto *catLay = qobject_cast<QHBoxLayout *>(m_catBar->layout());
-    // 移除 stretch，重加
-    if (catLay->count() > 1) {
-        QLayoutItem *stretchItem = catLay->takeAt(catLay->count() - 1);
-        delete stretchItem;
-    }
+    auto *catLay = m_catBar->layout();
 
     for (const QString &cat : allCats) {
         auto *btn = new QToolButton(m_catBar);
@@ -565,7 +616,6 @@ void DocBrowserPage::rebuildCategoryFilter()
             refreshDocGrid();
         });
     }
-    catLay->addStretch();
 
     m_btnAll->setChecked(m_activeCategory.isEmpty() && !m_showDownloadedOnly);
     m_btnDownloaded->setChecked(m_showDownloadedOnly);

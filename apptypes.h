@@ -187,6 +187,14 @@ struct OnlineAppInfo
     QUrl fullPackageUrl;
 
     /**
+     * @brief 单文件依赖下载基址。
+     *
+     * - 缺失少量依赖时，逐文件从此基址下载（拼接 ?file=相对路径）；
+     * - 为空表示服务端未配置依赖目录。
+     */
+    QUrl depsBaseUrl;
+
+    /**
      * @brief 当前版本更新说明。
      */
     QString changeLog;

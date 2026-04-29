@@ -102,12 +102,12 @@ QMessageBox::StandardButton showAdaptiveMessageBox(
     }
 
     box.setText(QStringLiteral("详细内容如下："));
-    box.setFixedWidth(kPopupFixedWidth);
 
     auto *textEdit = new QPlainTextEdit(&box);
     textEdit->setReadOnly(true);
     textEdit->setPlainText(text);
     textEdit->setMinimumHeight(kPopupScrollMinHeight);
+    textEdit->setMinimumWidth(kPopupFixedWidth - 80);
 
     if (QGridLayout *grid = qobject_cast<QGridLayout *>(box.layout())) {
         const int row = grid->rowCount();
@@ -115,6 +115,7 @@ QMessageBox::StandardButton showAdaptiveMessageBox(
         grid->addWidget(textEdit, row, 0, 1, colCount);
     }
 
+    box.setMinimumWidth(kPopupFixedWidth);
     return static_cast<QMessageBox::StandardButton>(box.exec());
 }
 
@@ -1404,6 +1405,12 @@ bool MainWindow::launchAppById(const QString &appId)
 
     // 纯本地应用：只检查 EXE 是否存在，直接启动
     if (isPureLocalApp) {
+        doActualLaunch(app);
+        return true;
+    }
+
+    // 未连接服务器时跳过依赖完整性检查，直接启动
+    if (!m_serverConnected) {
         doActualLaunch(app);
         return true;
     }
@@ -2961,70 +2968,80 @@ void MainWindow::onCheckAppManagerUpdate()
     }
 
     // 提示用户升级
-    QString updateMsg = QStringLiteral("发现 AppManager 新版本 v%1\n\n当前版本: v%2")
-                            .arg(latestVersion, currentVersion);
-    if (!online.changeLog.isEmpty()) {
-        updateMsg += QStringLiteral("\n\n更新说明:\n%1").arg(online.changeLog);
-    }
-    updateMsg += QStringLiteral("\n\n是否立即升级?");
+    {
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Question);
+        box.setWindowTitle(QStringLiteral("发现新版本"));
+        box.setText(QStringLiteral("发现 AppManager 新版本 v%1\n当前版本: v%2\n\n是否立即升级?")
+                        .arg(latestVersion, currentVersion));
+        box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+        box.setDefaultButton(QMessageBox::Yes);
 
-    QMessageBox::StandardButton ret = showAdaptiveMessageBox(
-        this,
-        QMessageBox::Question,
-        QStringLiteral("发现新版本"),
-        updateMsg,
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::Yes);
-
-    if (ret == QMessageBox::Yes) {
-        appendLog(QStringLiteral("正在下载 AppManager v%1...").arg(latestVersion));
-        
-        QProgressDialog dlProgress(QStringLiteral("正在下载 AppManager..."), QString(), 0, 100, this);
-        setupUnifiedProgressDialog(dlProgress, QStringLiteral("正在下载 AppManager..."), false);
-        dlProgress.show();
-        QApplication::processEvents();
-
-        QString result;
-        if (!m_service.upgradeAppManager(
-                online,
-                result,
-                30000,
-                [&](qint64 received, qint64 total) {
-                    if (total > 0) {
-                        const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
-                        dlProgress.setValue(p);
-                    }
-                    QApplication::processEvents();
-                },
-                [&](const QString &status) {
-                    dlProgress.setLabelText(compactStatusText(status, 120));
-                    QApplication::processEvents();
-                })) {
-            dlProgress.close();
-            logToFile(QStringLiteral("[AppManager] 升级失败: %1").arg(result));
-            showAdaptiveMessageBox(this,
-                                   QMessageBox::Warning,
-                                   QStringLiteral("升级失败"),
-                                   result,
-                                   QMessageBox::Ok,
-                                   QMessageBox::Ok);
-        } else {
-            dlProgress.setValue(100);
-            dlProgress.close();
-            logToFile(QStringLiteral("[AppManager] %1").arg(result));
-            showAdaptiveMessageBox(this,
-                                   QMessageBox::Information,
-                                   QStringLiteral("升级进行中"),
-                                   QStringLiteral("[AppManager] %1").arg(result),
-                                   QMessageBox::Ok,
-                                   QMessageBox::Ok);
-            
-            // 2秒后关闭应用，让安装程序进行
-            QTimer::singleShot(2000, this, [this]() {
-                QApplication::quit();
-            });
+        if (!online.changeLog.isEmpty()) {
+            auto *logEdit = new QPlainTextEdit(&box);
+            logEdit->setReadOnly(true);
+            logEdit->setPlainText(QStringLiteral("更新说明:\n%1").arg(online.changeLog));
+            logEdit->setMinimumHeight(160);
+            logEdit->setMinimumWidth(440);
+            if (auto *grid = qobject_cast<QGridLayout *>(box.layout())) {
+                const int row = grid->rowCount();
+                grid->addWidget(logEdit, row, 0, 1, grid->columnCount());
+            }
+            box.setMinimumWidth(520);
         }
-    }
+
+        const auto ret = static_cast<QMessageBox::StandardButton>(box.exec());
+
+        if (ret == QMessageBox::Yes) {
+            appendLog(QStringLiteral("正在下载 AppManager v%1...").arg(latestVersion));
+        
+            QProgressDialog dlProgress(QStringLiteral("正在下载 AppManager..."), QString(), 0, 100, this);
+            setupUnifiedProgressDialog(dlProgress, QStringLiteral("正在下载 AppManager..."), false);
+            dlProgress.show();
+            QApplication::processEvents();
+
+            QString result;
+            if (!m_service.upgradeAppManager(
+                    online,
+                    result,
+                    30000,
+                    [&](qint64 received, qint64 total) {
+                        if (total > 0) {
+                            const int p = qBound(0, static_cast<int>((received * 100) / total), 100);
+                            dlProgress.setValue(p);
+                        }
+                        QApplication::processEvents();
+                    },
+                    [&](const QString &status) {
+                        dlProgress.setLabelText(compactStatusText(status, 120));
+                        QApplication::processEvents();
+                    })) {
+                dlProgress.close();
+                logToFile(QStringLiteral("[AppManager] 升级失败: %1").arg(result));
+                showAdaptiveMessageBox(this,
+                                       QMessageBox::Warning,
+                                       QStringLiteral("升级失败"),
+                                       result,
+                                       QMessageBox::Ok,
+                                       QMessageBox::Ok);
+            } else {
+                dlProgress.setValue(100);
+                dlProgress.close();
+                logToFile(QStringLiteral("[AppManager] %1").arg(result));
+                showAdaptiveMessageBox(this,
+                                       QMessageBox::Information,
+                                       QStringLiteral("升级进行中"),
+                                       QStringLiteral("[AppManager] %1").arg(result),
+                                       QMessageBox::Ok,
+                                       QMessageBox::Ok);
+            
+                // 2秒后关闭应用，让安装程序进行
+                QTimer::singleShot(2000, this, [this]() {
+                    QApplication::quit();
+                });
+            }
+        }
+    } // end update prompt block
 }
 
 void MainWindow::onAboutAppManager()

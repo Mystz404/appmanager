@@ -52,8 +52,8 @@ UpdateDialog::UpdateDialog(AppManagerService *service,
     , m_apps(apps)
 {
     setWindowTitle(QStringLiteral("在线升级"));
-    setMinimumSize(560, 420);
-    resize(620, 500);
+    setMinimumSize(620, 480);
+    resize(720, 560);
     setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
     buildUi();
 }
@@ -436,34 +436,72 @@ void UpdateDialog::runUpgradePhase(const QList<int> &selectedIndexes)
 
             QString depResult;
             const int baseProgress = i * 100;
-            const bool depOk = m_service->checkAndFixDependencies(
-                app, online, depResult, 180000,
-                // 下载进度
-                [&](qint64 received, qint64 total) {
-                    if (total <= 0) return;
-                    int pct = static_cast<int>((received * 100) / total);
-                    pct = qBound(0, pct, 100);
-                    m_upgradeProgress->setValue(baseProgress + (pct * 30) / 100);
-                    QApplication::processEvents();
-                },
-                // 状态文本
-                [&](const QString &status) {
-                    m_upgradeLabel->setText(QStringLiteral("依赖修复 [%1/%2] %3\n%4")
-                                                .arg(i + 1)
-                                                .arg(selectedIndexes.size())
-                                                .arg(app.name, compactStatus(status)));
-                    emitLog(QStringLiteral("[%1] %2").arg(app.name, status));
-                    QApplication::processEvents();
-                },
-                // 安装进度
-                [&](int installPct) {
-                    m_upgradeProgress->setValue(baseProgress + (qBound(0, installPct, 100) * 30) / 100);
-                    QApplication::processEvents();
-                },
-                // 取消检测
-                [this]() {
-                    return m_canceled;
-                });
+            bool depOk = false;
+            bool depForceRedownload = false;
+            bool skipByDepFailure = false;
+            while (true) {
+                depOk = m_service->checkAndFixDependencies(
+                    app, online, depResult, 180000,
+                    // 下载进度
+                    [&](qint64 received, qint64 total) {
+                        if (total <= 0) return;
+                        int pct = static_cast<int>((received * 100) / total);
+                        pct = qBound(0, pct, 100);
+                        m_upgradeProgress->setValue(baseProgress + (pct * 30) / 100);
+                        QApplication::processEvents();
+                    },
+                    // 状态文本
+                    [&](const QString &status) {
+                        m_upgradeLabel->setText(QStringLiteral("依赖修复 [%1/%2] %3\n%4")
+                                                    .arg(i + 1)
+                                                    .arg(selectedIndexes.size())
+                                                    .arg(app.name, compactStatus(status)));
+                        emitLog(QStringLiteral("[%1] %2").arg(app.name, status));
+                        QApplication::processEvents();
+                    },
+                    // 安装进度
+                    [&](int installPct) {
+                        m_upgradeProgress->setValue(baseProgress + (qBound(0, installPct, 100) * 30) / 100);
+                        QApplication::processEvents();
+                    },
+                    // 取消检测
+                    [this]() {
+                        return m_canceled;
+                    },
+                    depForceRedownload);
+
+                if (depOk || m_canceled) {
+                    break;
+                }
+
+                emitLog(QStringLiteral("[%1] 依赖修复失败：%2").arg(app.name, depResult));
+
+                QMessageBox box(this);
+                box.setIcon(QMessageBox::Warning);
+                box.setWindowTitle(QStringLiteral("依赖修复失败"));
+                box.setText(QStringLiteral("%1 依赖修复失败：\n%2").arg(app.name, depResult));
+                auto *retryBtn = box.addButton(QStringLiteral("重试（使用已下载文件）"), QMessageBox::AcceptRole);
+                auto *redownloadBtn = box.addButton(QStringLiteral("删除已下载文件并重下"), QMessageBox::DestructiveRole);
+                auto *continueBtn = box.addButton(QStringLiteral("仍然继续升级"), QMessageBox::YesRole);
+                auto *skipBtn = box.addButton(QStringLiteral("跳过该应用"), QMessageBox::RejectRole);
+                box.setDefaultButton(qobject_cast<QPushButton *>(retryBtn));
+                box.exec();
+
+                if (box.clickedButton() == retryBtn) {
+                    depForceRedownload = false;
+                    continue;
+                }
+                if (box.clickedButton() == redownloadBtn) {
+                    depForceRedownload = true;
+                    continue;
+                }
+                if (box.clickedButton() == continueBtn) {
+                    break;
+                }
+
+                skipByDepFailure = true;
+                break;
+            }
 
             if (!depOk) {
                 if (m_canceled) {
@@ -471,17 +509,8 @@ void UpdateDialog::runUpgradePhase(const QList<int> &selectedIndexes)
                     wasCanceled = true;
                     break;
                 }
-                emitLog(QStringLiteral("[%1] 依赖修复失败：%2").arg(app.name, depResult));
-
-                const int ret = QMessageBox::question(
-                    this,
-                    QStringLiteral("依赖文件不完整"),
-                    QStringLiteral("%1 的依赖文件不完整，修复失败。\n\n%2\n\n是否仍然继续升级？")
-                        .arg(app.name, depResult),
-                    QMessageBox::Yes | QMessageBox::No,
-                    QMessageBox::No);
-                if (ret != QMessageBox::Yes) {
-                    emitLog(QStringLiteral("[%1] 用户取消升级（依赖不完整）").arg(app.name));
+                if (skipByDepFailure) {
+                    emitLog(QStringLiteral("[%1] 用户选择跳过（依赖修复失败）").arg(app.name));
                     m_upgradeProgress->setValue((i + 1) * 100);
                     continue;
                 }
@@ -496,38 +525,68 @@ void UpdateDialog::runUpgradePhase(const QList<int> &selectedIndexes)
 
         const int baseProgress = i * 100;
         QString result;
-        const bool ok = m_service->upgradeApp(
-            app, online, result, 180000,
-            // 下载进度回调（整体 0–70%）
-            [&](qint64 received, qint64 total) {
-                if (total <= 0) {
-                    m_upgradeProgress->setValue(baseProgress);
-                    return;
-                }
-                int pct = static_cast<int>((received * 100) / total);
-                pct = qBound(0, pct, 100);
-                m_upgradeProgress->setValue(baseProgress + (pct * 70) / 100);
-                QApplication::processEvents();
-            },
-            // 状态文本回调
-            [&](const QString &status) {
-                const QString compact = compactStatus(status);
-                m_upgradeLabel->setText(QStringLiteral("正在升级 [%1/%2] %3\n%4")
-                                            .arg(i + 1)
-                                            .arg(selectedIndexes.size())
-                                            .arg(app.name, compact));
-                emitLog(QStringLiteral("[%1] %2").arg(app.name, status));
-                QApplication::processEvents();
-            },
-            // 安装进度回调（整体 70–100%）
-            [&](int installPct) {
-                const int p = qBound(0, installPct, 100);
-                m_upgradeProgress->setValue(baseProgress + 70 + (p * 30) / 100);
-                QApplication::processEvents();
-            },
-            [this]() {
-                return m_canceled;
-            });
+        bool ok = false;
+        bool forceRedownload = false;
+        while (true) {
+            ok = m_service->upgradeApp(
+                app, online, result, 180000,
+                // 下载进度回调（整体 0–70%）
+                [&](qint64 received, qint64 total) {
+                    if (total <= 0) {
+                        m_upgradeProgress->setValue(baseProgress);
+                        return;
+                    }
+                    int pct = static_cast<int>((received * 100) / total);
+                    pct = qBound(0, pct, 100);
+                    m_upgradeProgress->setValue(baseProgress + (pct * 70) / 100);
+                    QApplication::processEvents();
+                },
+                // 状态文本回调
+                [&](const QString &status) {
+                    const QString compact = compactStatus(status);
+                    m_upgradeLabel->setText(QStringLiteral("正在升级 [%1/%2] %3\n%4")
+                                                .arg(i + 1)
+                                                .arg(selectedIndexes.size())
+                                                .arg(app.name, compact));
+                    emitLog(QStringLiteral("[%1] %2").arg(app.name, status));
+                    QApplication::processEvents();
+                },
+                // 安装进度回调（整体 70–100%）
+                [&](int installPct) {
+                    const int p = qBound(0, installPct, 100);
+                    m_upgradeProgress->setValue(baseProgress + 70 + (p * 30) / 100);
+                    QApplication::processEvents();
+                },
+                [this]() {
+                    return m_canceled;
+                },
+                forceRedownload);
+
+            if (ok || m_canceled) {
+                break;
+            }
+
+            emitLog(QStringLiteral("[%1] 升级失败：%2").arg(app.name, result));
+            QMessageBox box(this);
+            box.setIcon(QMessageBox::Warning);
+            box.setWindowTitle(QStringLiteral("升级失败"));
+            box.setText(QStringLiteral("%1 升级失败：\n%2").arg(app.name, result));
+            auto *retryBtn = box.addButton(QStringLiteral("重试（使用已下载文件）"), QMessageBox::AcceptRole);
+            auto *redownloadBtn = box.addButton(QStringLiteral("删除已下载文件并重下"), QMessageBox::DestructiveRole);
+            auto *skipBtn = box.addButton(QStringLiteral("跳过该应用"), QMessageBox::RejectRole);
+            box.setDefaultButton(qobject_cast<QPushButton *>(retryBtn));
+            box.exec();
+
+            if (box.clickedButton() == retryBtn) {
+                forceRedownload = false;
+                continue;
+            }
+            if (box.clickedButton() == redownloadBtn) {
+                forceRedownload = true;
+                continue;
+            }
+            break;
+        }
 
         m_upgradeProgress->setValue((i + 1) * 100);
         QApplication::processEvents();

@@ -19,7 +19,13 @@
 #include <QTextStream>
 #include <QTimer>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QRegularExpression>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <TlHelp32.h>
+#endif
 
 namespace {
 
@@ -323,6 +329,256 @@ bool parseAppsArray(const QJsonArray &appsArray,
     return true;
 }
 
+QString persistentDownloadCacheDir()
+{
+    const QString root = QDir(QCoreApplication::applicationDirPath())
+                             .absoluteFilePath(QStringLiteral("download_cache"));
+    QDir().mkpath(root);
+    return root;
+}
+
+QString cachedUpgradePackagePath(const AppConfig &app, const OnlineAppInfo &online)
+{
+    QString packageExt = QStringLiteral(".bin");
+    const QString pathPart = online.downloadUrl.path().toLower();
+    if (pathPart.endsWith(QStringLiteral(".zip"))) {
+        packageExt = QStringLiteral(".zip");
+    } else if (pathPart.endsWith(QStringLiteral(".exe"))) {
+        packageExt = QStringLiteral(".exe");
+    }
+
+    const QString dir = QDir(persistentDownloadCacheDir()).absoluteFilePath(QStringLiteral("upgrades"));
+    QDir().mkpath(dir);
+    return QDir(dir).absoluteFilePath(
+        QStringLiteral("%1_%2%3").arg(app.id, online.latestVersion, packageExt));
+}
+
+QString cachedFullPackagePath(const AppConfig &app, const OnlineAppInfo &online)
+{
+    const QString dir = QDir(persistentDownloadCacheDir()).absoluteFilePath(QStringLiteral("full_packages"));
+    QDir().mkpath(dir);
+    return QDir(dir).absoluteFilePath(
+        QStringLiteral("%1_%2_full.zip").arg(app.id, online.latestVersion));
+}
+
+QString resolvePowerShellProgram()
+{
+#ifdef Q_OS_WIN
+    // 优先使用可验证存在的绝对路径；
+    // 32 位进程访问 64 位 PowerShell 需要通过 Sysnative 虚拟目录。
+    const QStringList absolutePaths = {
+        QStringLiteral("C:/Windows/Sysnative/WindowsPowerShell/v1.0/powershell.exe"),
+        QStringLiteral("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    };
+    for (const QString &path : absolutePaths) {
+        if (QFileInfo::exists(path)) {
+            return path;
+        }
+    }
+    // 绝对路径均不存在时回退到 PATH 查找
+    return QStringLiteral("powershell.exe");
+#else
+    return QStringLiteral("powershell");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+//  extractZipFile — 健壮的 ZIP 解压函数
+//
+//  改进点（对比之前的内联实现）：
+//    1. 每个文件解压用 try/catch 包裹，单文件失败不中断整体解压。
+//    2. 同时读取 stdout 和 stderr 管道，防止 stderr 缓冲区满导致进程死锁。
+//    3. 路径中的单引号正确转义（''），防止 PowerShell 脚本注入/崩溃。
+//    4. 支持解压超时（默认 10 分钟），防止挂死。
+//    5. 使用 [Console]::Out.WriteLine 直接写 stdout，性能优于 Write-Output。
+// ---------------------------------------------------------------------------
+bool extractZipFile(const QString &zipFilePath,
+                    const QString &destDir,
+                    QString &errorMessage,
+                    const std::function<void(int pct)> &progressCallback = {},
+                    const std::function<void(const QString &msg)> &statusCallback = {},
+                    int timeoutSecs = 600)
+{
+#ifdef Q_OS_WIN
+    // 转义单引号用于 PowerShell 单引号字符串
+    QString psZipPath = QDir::toNativeSeparators(zipFilePath);
+    psZipPath.replace(QLatin1Char('\''), QStringLiteral("''"));
+    QString psDestPath = QDir::toNativeSeparators(destDir);
+    psDestPath.replace(QLatin1Char('\''), QStringLiteral("''"));
+
+    QProcess process;
+    process.setProgram(resolvePowerShellProgram());
+    process.setArguments({
+        QStringLiteral("-NoProfile"),
+        QStringLiteral("-ExecutionPolicy"),
+        QStringLiteral("Bypass"),
+        QStringLiteral("-Command"),
+        QStringLiteral(
+            "$ErrorActionPreference='Stop';"
+            "try{"
+            "  Add-Type -AssemblyName System.IO.Compression.FileSystem;"
+            "  $zip=[System.IO.Compression.ZipFile]::OpenRead('%1');"
+            "  $entries=@($zip.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) });"
+            "  $total=[Math]::Max($entries.Count,1);"
+            "  $idx=0;$errCount=0;"
+            "  foreach($e in $entries){"
+            "    try{"
+            "      $out=[System.IO.Path]::GetFullPath("
+            "        [System.IO.Path]::Combine('%2',$e.FullName));"
+            "      $dir=[System.IO.Path]::GetDirectoryName($out);"
+            "      if(-not [string]::IsNullOrEmpty($dir)){"
+            "        [void][System.IO.Directory]::CreateDirectory($dir)};"
+            "      [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e,$out,$true)"
+            "    }catch{"
+            "      $errCount++;"
+            "      [Console]::Out.WriteLine('EXTRACT_ERROR:'+$e.FullName+': '+$_.Exception.Message)"
+            "    }"
+            "    $idx++;"
+            "    [Console]::Out.WriteLine('PROGRESS:'+[int](($idx*100)/$total))"
+            "  }"
+            "  $zip.Dispose();"
+            "  if($errCount -gt 0){"
+            "    [Console]::Out.WriteLine('TOTAL_ERRORS:'+$errCount)}"
+            "}catch{"
+            "  [Console]::Out.WriteLine('FATAL:'+$_.Exception.Message);"
+            "  exit 1"
+            "}")
+            .arg(psZipPath, psDestPath)
+    });
+    process.setProcessChannelMode(QProcess::SeparateChannels);
+    process.start();
+    if (!process.waitForStarted(10000)) {
+        errorMessage = QStringLiteral("无法启动解压进程（PowerShell），请确认系统 PowerShell 可用");
+        return false;
+    }
+
+    QByteArray stdoutBuf;
+    QByteArray stderrAccum;
+    QStringList extractErrors;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const qint64 timeoutMs = static_cast<qint64>(timeoutSecs) * 1000;
+
+    while (process.state() != QProcess::NotRunning) {
+        // 超时保护
+        if (timeoutMs > 0 && elapsed.elapsed() > timeoutMs) {
+            process.kill();
+            process.waitForFinished(3000);
+            errorMessage = QStringLiteral("解压超时（已等待 %1 秒），进程已终止").arg(timeoutSecs);
+            return false;
+        }
+
+        process.waitForReadyRead(300);
+
+        // **关键**：必须同时读取 stdout 和 stderr，防止管道缓冲区满导致进程死锁
+        stdoutBuf.append(process.readAllStandardOutput());
+        stderrAccum.append(process.readAllStandardError());
+
+        // 解析完整行
+        while (true) {
+            const int eol = stdoutBuf.indexOf('\n');
+            if (eol < 0) break;
+            const QByteArray line = stdoutBuf.left(eol).trimmed();
+            stdoutBuf.remove(0, eol + 1);
+
+            if (line.startsWith("PROGRESS:")) {
+                bool ok = false;
+                const int pct = QString::fromLatin1(line.mid(9)).toInt(&ok);
+                if (ok && progressCallback) {
+                    progressCallback(pct);
+                }
+            } else if (line.startsWith("EXTRACT_ERROR:")) {
+                const QString errDetail = QString::fromUtf8(line.mid(14));
+                extractErrors.append(errDetail);
+                if (statusCallback) {
+                    statusCallback(QStringLiteral("解压文件出错（已跳过）: %1").arg(errDetail));
+                }
+            } else if (line.startsWith("FATAL:")) {
+                errorMessage = QStringLiteral("解压致命错误: %1")
+                                   .arg(QString::fromUtf8(line.mid(6)));
+                process.waitForFinished(3000);
+                return false;
+            }
+        }
+
+        if (!process.waitForFinished(10)) {
+            continue;
+        }
+    }
+
+    // 读取剩余输出
+    stdoutBuf.append(process.readAllStandardOutput());
+    stderrAccum.append(process.readAllStandardError());
+    while (true) {
+        const int eol = stdoutBuf.indexOf('\n');
+        if (eol < 0) break;
+        const QByteArray line = stdoutBuf.left(eol).trimmed();
+        stdoutBuf.remove(0, eol + 1);
+        if (line.startsWith("EXTRACT_ERROR:")) {
+            extractErrors.append(QString::fromUtf8(line.mid(14)));
+        } else if (line.startsWith("FATAL:")) {
+            errorMessage = QStringLiteral("解压致命错误: %1")
+                               .arg(QString::fromUtf8(line.mid(6)));
+            return false;
+        }
+    }
+
+    if (process.exitStatus() != QProcess::NormalExit) {
+        errorMessage = QStringLiteral("解压进程异常终止");
+        return false;
+    }
+
+    if (process.exitCode() != 0) {
+        const QString stderrStr = QString::fromLocal8Bit(stderrAccum).trimmed();
+        errorMessage = QStringLiteral("解压失败（退出码 %1）: %2")
+                           .arg(process.exitCode())
+                           .arg(stderrStr.isEmpty() ? QStringLiteral("未知错误") : stderrStr);
+        return false;
+    }
+
+    // 有部分文件出错但整体完成 — 记录警告，返回成功（调用方后续验证会发现缺失）
+    if (!extractErrors.isEmpty()) {
+        if (statusCallback) {
+            statusCallback(QStringLiteral("解压完成，但有 %1 个文件出错（已跳过）")
+                               .arg(extractErrors.size()));
+        }
+        errorMessage = QStringLiteral("解压过程中 %1 个文件出错（已跳过），后续校验可能发现缺失")
+                           .arg(extractErrors.size());
+    }
+
+    return true;
+#else
+    Q_UNUSED(zipFilePath)
+    Q_UNUSED(destDir)
+    Q_UNUSED(progressCallback)
+    Q_UNUSED(statusCallback)
+    Q_UNUSED(timeoutSecs)
+    errorMessage = QStringLiteral("当前平台暂不支持 ZIP 解压");
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+//  unwrapSingleTopLevelDir — 剥离 ZIP 中常见的"唯一顶层目录"
+//
+//  许多 ZIP 打包后内部结构为 AppName_v1.0/file1.dll，解压到 extractedDir 后
+//  实际文件在 extractedDir/AppName_v1.0/ 下。直接用 extractedDir 做源目录复制
+//  会在目标目录多套一层。
+//
+//  本函数检测：如果 extractedDir 下恰好只有1个子目录且0个文件，则返回该
+//  子目录路径作为真正的源目录；否则原样返回 extractedDir。
+// ---------------------------------------------------------------------------
+QString unwrapSingleTopLevelDir(const QString &extractedDir)
+{
+    const QDir dir(extractedDir);
+    const QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
+
+    if (entries.size() == 1 && entries.first().isDir()) {
+        return entries.first().absoluteFilePath();
+    }
+    return extractedDir;
+}
+
 bool loadPersistedApps(const QString &appListPath,
                        bool &exists,
                        QJsonArray &appsArray,
@@ -397,6 +653,63 @@ QJsonArray buildAppsArray(const QVector<AppConfig> &apps)
     }
     return appsArray;
 }
+
+#ifdef Q_OS_WIN
+static bool isAppProcessRunning(const QString &exePath)
+{
+    const QString exeName = QFileInfo(exePath).fileName();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (exeName.compare(QString::fromWCharArray(pe.szExeFile), Qt::CaseInsensitive) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+static bool killAppProcess(const QString &exePath)
+{
+    const QString exeName = QFileInfo(exePath).fileName();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    bool anyFound = false;
+    bool allOk = true;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (exeName.compare(QString::fromWCharArray(pe.szExeFile), Qt::CaseInsensitive) == 0) {
+                anyFound = true;
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    if (TerminateProcess(hProc, 0)) {
+                        WaitForSingleObject(hProc, 5000);
+                    } else {
+                        allOk = false;
+                    }
+                    CloseHandle(hProc);
+                } else {
+                    allOk = false;
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return anyFound && allOk;
+}
+#endif
 
 }
 
@@ -704,6 +1017,14 @@ OnlineAppInfo AppManagerService::checkOnlineInfo(const AppConfig &app,
                                                        m_serverBaseUrl);
     }
 
+    // 解析单文件依赖下载基址
+    const QString depsBaseStr = obj.value(QStringLiteral("depsBaseUrl")).toString().trimmed();
+    if (!depsBaseStr.isEmpty()) {
+        info.depsBaseUrl = rebaseToConfiguredServer(depsBaseStr,
+                                                    QUrl(depsBaseStr),
+                                                    m_serverBaseUrl);
+    }
+
     // 解析当前版本更新说明
     info.changeLog = obj.value(QStringLiteral("changeLog")).toString().trimmed();
 
@@ -783,7 +1104,8 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
                                                  const DownloadProgressCallback &progressCallback,
                                                  const StatusCallback &statusCallback,
                                                  const InstallProgressCallback &installProgressCallback,
-                                                 const CancelCallback &cancelCallback)
+                                                 const CancelCallback &cancelCallback,
+                                                 bool forceRedownload)
 {
     // 没有服务器指定的依赖文件列表，跳过检查
     if (online.requiredFiles.isEmpty()) {
@@ -817,6 +1139,106 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
                            .arg(missingFiles.join(QStringLiteral(", "))));
     }
 
+    // 策略选择：少量缺失（≤6）且服务端配置了依赖目录时，逐文件下载以减少下载量
+    static constexpr int SINGLE_FILE_THRESHOLD = 6;
+    if (missingFiles.size() <= SINGLE_FILE_THRESHOLD && online.depsBaseUrl.isValid()) {
+        if (statusCallback) {
+            statusCallback(QStringLiteral("缺失文件 %1 个（≤%2），使用逐文件下载模式")
+                               .arg(missingFiles.size()).arg(SINGLE_FILE_THRESHOLD));
+        }
+        if (installProgressCallback) {
+            installProgressCallback(5);
+        }
+
+        int downloaded = 0;
+        QStringList failedFiles;
+        QStringList notFoundFiles;
+        for (int i = 0; i < missingFiles.size(); ++i) {
+            const QString &relFile = missingFiles.at(i);
+            if (cancelCallback && cancelCallback()) {
+                resultMessage = QStringLiteral("依赖修复已取消");
+                return false;
+            }
+
+            // 去除 ./ 前缀，仅保留相对文件名用于服务端查找
+            QString cleanedFile = relFile;
+            while (cleanedFile.startsWith(QStringLiteral("./")))
+                cleanedFile = cleanedFile.mid(2);
+            while (cleanedFile.startsWith(QStringLiteral(".\\")))
+                cleanedFile = cleanedFile.mid(2);
+
+            // 构建下载 URL：depsBaseUrl?file=<percent-encoded-cleanedFile>
+            QUrl fileUrl(online.depsBaseUrl);
+            const QString query = QStringLiteral("file=%1")
+                                      .arg(QString::fromUtf8(QUrl::toPercentEncoding(cleanedFile)));
+            fileUrl.setQuery(query);
+
+            const QString absPath = requiredFileAbsolutePath(appInstallDir, relFile);
+            QDir().mkpath(QFileInfo(absPath).absolutePath());
+
+            if (statusCallback) {
+                statusCallback(QStringLiteral("下载依赖 [%1/%2]: %3")
+                                   .arg(i + 1).arg(missingFiles.size()).arg(relFile));
+            }
+
+            QString dlError;
+            const bool ok = downloadFileWithResume(
+                fileUrl, absPath, dlError, timeoutMs,
+                [&](qint64 recv, qint64 total) {
+                    if (progressCallback && total > 0) {
+                        progressCallback(recv, total);
+                    }
+                },
+                StatusCallback(),
+                cancelCallback);
+
+            if (ok) {
+                ++downloaded;
+            } else {
+                failedFiles.append(relFile);
+                // 判断是否为 404（文件在服务端依赖目录中不存在）
+                const bool is404 = dlError.contains(QStringLiteral("404"))
+                                   || dlError.contains(QStringLiteral("不存在"));
+                if (is404) {
+                    notFoundFiles.append(relFile);
+                    if (statusCallback) {
+                        statusCallback(QStringLiteral("服务端依赖目录中未找到文件: %1").arg(relFile));
+                    }
+                } else {
+                    if (statusCallback) {
+                        statusCallback(QStringLiteral("下载失败: %1 (%2)").arg(relFile, dlError));
+                    }
+                }
+            }
+
+            if (installProgressCallback) {
+                installProgressCallback(5 + (i + 1) * 90 / missingFiles.size());
+            }
+        }
+
+        if (failedFiles.isEmpty()) {
+            if (installProgressCallback) {
+                installProgressCallback(100);
+            }
+            resultMessage = QStringLiteral("依赖文件修复完成（逐文件下载 %1 个）").arg(downloaded);
+            if (statusCallback) {
+                statusCallback(resultMessage);
+            }
+            return true;
+        }
+
+        // 部分文件下载失败，提示后回退到完整包下载
+        if (statusCallback) {
+            if (!notFoundFiles.isEmpty()) {
+                statusCallback(QStringLiteral("以下 %1 个文件在服务端依赖目录中不存在：\n%2")
+                                   .arg(notFoundFiles.size())
+                                   .arg(notFoundFiles.join(QStringLiteral("\n"))));
+            }
+            statusCallback(QStringLiteral("共 %1 个文件下载失败，回退到完整包下载...")
+                               .arg(failedFiles.size()));
+        }
+    }
+
     // 检查服务端是否配置了完整包
     if (!online.fullPackageUrl.isValid()) {
         resultMessage = QStringLiteral("依赖文件不完整且服务器未提供完整软件包下载，无法自动修复。\n缺失文件：%1")
@@ -829,24 +1251,34 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
         statusCallback(QStringLiteral("正在下载完整软件包以修复缺失文件..."));
     }
 
-    QTemporaryDir tempDir;
-    if (!tempDir.isValid()) {
-        resultMessage = QStringLiteral("无法创建临时目录用于下载完整包");
-        return false;
+    const QString fullPkgPath = cachedFullPackagePath(app, online);
+
+    if (forceRedownload) {
+        QFile::remove(fullPkgPath);
+        QFile::remove(fullPkgPath + QStringLiteral(".part"));
+        if (statusCallback) {
+            statusCallback(QStringLiteral("已删除完整包缓存，准备重新下载: %1")
+                               .arg(QDir::toNativeSeparators(fullPkgPath)));
+        }
     }
 
-    const QString fullPkgPath = QDir(tempDir.path()).absoluteFilePath(QStringLiteral("full_package.zip"));
-
-    QString downloadError;
-    if (!downloadFileWithResume(online.fullPackageUrl,
-                                fullPkgPath,
-                                downloadError,
-                                timeoutMs,
-                                progressCallback,
-                                statusCallback,
-                                cancelCallback)) {
-        resultMessage = QStringLiteral("完整包下载失败：%1").arg(downloadError);
-        return false;
+    if (QFileInfo::exists(fullPkgPath)) {
+        if (statusCallback) {
+            statusCallback(QStringLiteral("检测到已下载完整包，直接复用: %1")
+                               .arg(QDir::toNativeSeparators(fullPkgPath)));
+        }
+    } else {
+        QString downloadError;
+        if (!downloadFileWithResume(online.fullPackageUrl,
+                                    fullPkgPath,
+                                    downloadError,
+                                    timeoutMs,
+                                    progressCallback,
+                                    statusCallback,
+                                    cancelCallback)) {
+            resultMessage = QStringLiteral("完整包下载失败：%1").arg(downloadError);
+            return false;
+        }
     }
 
     if (statusCallback) {
@@ -863,80 +1295,37 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
     QDir().mkpath(targetDir);
 
     // 解压完整包到目标目录
-    const QString extractedDir = QDir(tempDir.path()).absoluteFilePath(QStringLiteral("extracted"));
+    QTemporaryDir extractTempDir;
+    if (!extractTempDir.isValid()) {
+        resultMessage = QStringLiteral("无法创建临时目录用于解压完整包");
+        return false;
+    }
+    const QString extractedDir = QDir(extractTempDir.path()).absoluteFilePath(QStringLiteral("extracted"));
     QDir().mkpath(extractedDir);
 
-#ifdef Q_OS_WIN
-    QProcess process;
-    process.setProgram(QStringLiteral("powershell"));
-    process.setArguments({
-        QStringLiteral("-NoProfile"),
-        QStringLiteral("-ExecutionPolicy"),
-        QStringLiteral("Bypass"),
-        QStringLiteral("-Command"),
-        QStringLiteral(
-            "$zipPath='%1';"
-            "$destPath='%2';"
-            "Add-Type -AssemblyName System.IO.Compression.FileSystem;"
-            "$zip=[System.IO.Compression.ZipFile]::OpenRead($zipPath);"
-            "$entries=@($zip.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) });"
-            "$total=[Math]::Max($entries.Count,1);"
-            "$idx=0;"
-            "foreach($e in $entries){"
-            "  $out=[System.IO.Path]::Combine($destPath,$e.FullName);"
-            "  $dir=[System.IO.Path]::GetDirectoryName($out);"
-            "  if(-not [string]::IsNullOrEmpty($dir)){ [System.IO.Directory]::CreateDirectory($dir) | Out-Null };"
-            "  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e,$out,$true);"
-            "  $idx=$idx+1;"
-            "  $p=[int](($idx*100)/$total);"
-            "  Write-Output (\"PROGRESS:{0}\" -f $p);"
-            "}"
-            "$zip.Dispose();")
-            .arg(QDir::toNativeSeparators(fullPkgPath), QDir::toNativeSeparators(extractedDir))
-    });
-    process.setProcessChannelMode(QProcess::SeparateChannels);
-    process.start();
-    if (!process.waitForStarted(5000)) {
-        resultMessage = QStringLiteral("完整包解压失败：无法启动解压进程");
-        return false;
-    }
-
-    while (process.state() != QProcess::NotRunning) {
-        process.waitForReadyRead(200);
-        const QByteArray outChunk = process.readAllStandardOutput();
-        if (!outChunk.isEmpty()) {
-            const QList<QByteArray> lines = outChunk.split('\n');
-            for (const QByteArray &line : lines) {
-                QByteArray trimmed = line.trimmed();
-                if (trimmed.startsWith("PROGRESS:")) {
-                    bool ok = false;
-                    const int pct = QString::fromLatin1(trimmed.mid(9)).toInt(&ok);
-                    if (ok) {
-                        if (installProgressCallback) {
-                            installProgressCallback(10 + (pct * 60) / 100);
-                        }
-                        if (statusCallback && (pct % 20 == 0 || pct == 100)) {
-                            statusCallback(QStringLiteral("正在解压完整包...%1%").arg(pct));
-                        }
-                    }
-                }
+    QString extractError;
+    const bool extractOk = extractZipFile(
+        fullPkgPath, extractedDir, extractError,
+        [&](int pct) {
+            if (installProgressCallback) {
+                installProgressCallback(10 + (pct * 60) / 100);
             }
-        }
-        if (!process.waitForFinished(10)) {
-            continue;
-        }
-    }
-
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        const QString stdErr = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-        resultMessage = QStringLiteral("完整包解压失败：%1").arg(stdErr.isEmpty() ? QStringLiteral("未知错误") : stdErr);
+            if (statusCallback && (pct % 20 == 0 || pct == 100)) {
+                statusCallback(QStringLiteral("正在解压完整包...%1%").arg(pct));
+            }
+        },
+        statusCallback);
+    if (!extractOk) {
+        resultMessage = QStringLiteral("完整包解压失败：%1").arg(extractError);
         return false;
     }
-#else
-    Q_UNUSED(fullPkgPath)
-    resultMessage = QStringLiteral("当前平台暂不支持完整包解压");
-    return false;
-#endif
+
+    // 剥离 ZIP 中常见的唯一顶层目录（如 AppName_v1.0/）
+    const QString effectiveExtractedDir = unwrapSingleTopLevelDir(extractedDir);
+    if (effectiveExtractedDir != extractedDir && statusCallback) {
+        statusCallback(QStringLiteral("检测到压缩包有顶层目录，已自动剥离: %1")
+                           .arg(QDir(extractedDir).relativeFilePath(effectiveExtractedDir)));
+    }
 
     if (statusCallback) {
         statusCallback(QStringLiteral("解压完成，正在复制文件到目标目录..."));
@@ -976,7 +1365,7 @@ bool AppManagerService::checkAndFixDependencies(const AppConfig &app,
         return true;
     };
 
-    copyRecursive(extractedDir, targetDir);
+    copyRecursive(effectiveExtractedDir, targetDir);
 
     if (installProgressCallback) {
         installProgressCallback(95);
@@ -1015,7 +1404,8 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
                                    const DownloadProgressCallback &progressCallback,
                                    const StatusCallback &statusCallback,
                                    const InstallProgressCallback &installProgressCallback,
-                                   const CancelCallback &cancelCallback)
+                                   const CancelCallback &cancelCallback,
+                                   bool forceRedownload)
 {
     if (!online.requestSuccess) {
         resultMessage = QStringLiteral("无法升级，在线信息不可用: %1").arg(online.errorMessage);
@@ -1033,35 +1423,37 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
         statusCallback(QStringLiteral("开始下载升级包..."));
     }
 
-    QTemporaryDir downloadDir;
-    if (!downloadDir.isValid()) {
-        resultMessage = QStringLiteral("升级失败：无法创建临时下载目录");
-        return false;
-    }
+    const QString packageFilePath = cachedUpgradePackagePath(app, online);
 
-    QString packageExt = QStringLiteral(".bin");
-    const QString pathPart = online.downloadUrl.path().toLower();
-    if (pathPart.endsWith(QStringLiteral(".zip"))) {
-        packageExt = QStringLiteral(".zip");
-    } else if (pathPart.endsWith(QStringLiteral(".exe"))) {
-        packageExt = QStringLiteral(".exe");
-    }
-    const QString packageFilePath = QDir(downloadDir.path()).absoluteFilePath(
-        QStringLiteral("%1_%2%3").arg(app.id, online.latestVersion, packageExt));
-
-    QString downloadError;
-    if (!downloadFileWithResume(online.downloadUrl,
-                                packageFilePath,
-                                downloadError,
-                                timeoutMs,
-                                progressCallback,
-                                statusCallback,
-                                cancelCallback)) {
-        resultMessage = QStringLiteral("升级失败：下载中断或下载失败（支持断点续传）：%1").arg(downloadError);
+    if (forceRedownload) {
+        QFile::remove(packageFilePath);
+        QFile::remove(packageFilePath + QStringLiteral(".part"));
         if (statusCallback) {
-            statusCallback(resultMessage);
+            statusCallback(QStringLiteral("已删除升级包缓存，准备重新下载: %1")
+                               .arg(QDir::toNativeSeparators(packageFilePath)));
         }
-        return false;
+    }
+
+    if (QFileInfo::exists(packageFilePath)) {
+        if (statusCallback) {
+            statusCallback(QStringLiteral("检测到已下载升级包，直接复用: %1")
+                               .arg(QDir::toNativeSeparators(packageFilePath)));
+        }
+    } else {
+        QString downloadError;
+        if (!downloadFileWithResume(online.downloadUrl,
+                                    packageFilePath,
+                                    downloadError,
+                                    timeoutMs,
+                                    progressCallback,
+                                    statusCallback,
+                                    cancelCallback)) {
+            resultMessage = QStringLiteral("升级失败：下载中断或下载失败（支持断点续传）：%1").arg(downloadError);
+            if (statusCallback) {
+                statusCallback(resultMessage);
+            }
+            return false;
+        }
     }
 
     if (statusCallback) {
@@ -1102,6 +1494,28 @@ bool AppManagerService::upgradeApp(const AppConfig &app,
             return false;
         }
     }
+
+    // 下载和校验完成。若目标程序正在运行，先将其关闭再安装。
+#ifdef Q_OS_WIN
+    {
+        const QString targetExe = appAbsoluteExePath(app);
+        if (isAppProcessRunning(targetExe)) {
+            if (statusCallback) {
+                statusCallback(QStringLiteral("检测到程序正在运行，正在自动关闭..."));
+            }
+            if (!killAppProcess(targetExe)) {
+                resultMessage = QStringLiteral("升级失败：目标程序正在运行且无法自动关闭，请手动关闭后重试");
+                if (statusCallback) {
+                    statusCallback(resultMessage);
+                }
+                return false;
+            }
+            if (statusCallback) {
+                statusCallback(QStringLiteral("程序已关闭，继续安装..."));
+            }
+        }
+    }
+#endif
 
     if (online.packageType == QStringLiteral("zip")) {
         if (statusCallback) {
@@ -1261,91 +1675,36 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
         statusCallback(QStringLiteral("正在解压 ZIP 包..."));
     }
 
-    // 使用 PowerShell 原生 Expand-Archive 执行解压覆盖，避免引入额外第三方压缩库依赖。
-    QProcess process;
-    process.setProgram(QStringLiteral("powershell"));
-    process.setArguments({
-        QStringLiteral("-NoProfile"),
-        QStringLiteral("-ExecutionPolicy"),
-        QStringLiteral("Bypass"),
-        QStringLiteral("-Command"),
-        QStringLiteral(
-            "$zipPath='%1';"
-            "$destPath='%2';"
-            "Add-Type -AssemblyName System.IO.Compression.FileSystem;"
-            "$zip=[System.IO.Compression.ZipFile]::OpenRead($zipPath);"
-            "$entries=@($zip.Entries | Where-Object { -not [string]::IsNullOrEmpty($_.Name) });"
-            "$total=[Math]::Max($entries.Count,1);"
-            "$idx=0;"
-            "foreach($e in $entries){"
-            "  $out=[System.IO.Path]::Combine($destPath,$e.FullName);"
-            "  $dir=[System.IO.Path]::GetDirectoryName($out);"
-            "  if(-not [string]::IsNullOrEmpty($dir)){ [System.IO.Directory]::CreateDirectory($dir) | Out-Null };"
-            "  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e,$out,$true);"
-            "  $idx=$idx+1;"
-            "  $p=[int](($idx*100)/$total);"
-            "  Write-Output (\"PROGRESS:{0}\" -f $p);"
-            "}"
-            "$zip.Dispose();")
-            .arg(QDir::toNativeSeparators(zipFilePath), QDir::toNativeSeparators(extractedDir))
-    });
-    process.setProcessChannelMode(QProcess::SeparateChannels);
-    process.start();
-    if (!process.waitForStarted(5000)) {
-        resultMessage = QStringLiteral("ZIP 解压失败：无法启动解压进程");
-        if (statusCallback) {
-            statusCallback(resultMessage);
-        }
-        return false;
-    }
-
-    QByteArray stdoutBuffer;
-    qint64 lastOutputTick = 0;
-    while (process.state() != QProcess::NotRunning) {
-        process.waitForReadyRead(200);
-        const QByteArray outChunk = process.readAllStandardOutput();
-        if (!outChunk.isEmpty()) {
-            stdoutBuffer.append(outChunk);
-            while (true) {
-                int eolPos = stdoutBuffer.indexOf('\n');
-                if (eolPos < 0) {
-                    break;
+    {
+        qint64 lastOutputTick = 0;
+        QString extractError;
+        const bool extractOk = extractZipFile(
+            zipFilePath, extractedDir, extractError,
+            [&](int zipPercent) {
+                const int mappedPercent = qBound(5, 5 + (zipPercent * 65) / 100, 70);
+                if (installProgressCallback) {
+                    installProgressCallback(mappedPercent);
                 }
-                QByteArray line = stdoutBuffer.left(eolPos).trimmed();
-                stdoutBuffer.remove(0, eolPos + 1);
-                if (line.startsWith("PROGRESS:")) {
-                    bool ok = false;
-                    const int zipPercent = QString::fromLatin1(line.mid(9)).toInt(&ok);
-                    if (ok) {
-                        const int mappedPercent = qBound(5, 5 + (zipPercent * 65) / 100, 70);
-                        if (installProgressCallback) {
-                            installProgressCallback(mappedPercent);
-                        }
-                        if (statusCallback && (zipPercent - lastOutputTick >= 10 || zipPercent == 100)) {
-                            statusCallback(QStringLiteral("正在解压 ZIP 包...%1%").arg(zipPercent));
-                            lastOutputTick = zipPercent;
-                        }
-                    }
+                if (statusCallback && (zipPercent - lastOutputTick >= 10 || zipPercent == 100)) {
+                    statusCallback(QStringLiteral("正在解压 ZIP 包...%1%").arg(zipPercent));
+                    lastOutputTick = zipPercent;
                 }
+            },
+            statusCallback);
+        if (!extractOk) {
+            resultMessage = QStringLiteral("ZIP 解压失败: %1").arg(extractError);
+            if (statusCallback) {
+                statusCallback(resultMessage);
             }
-        }
-        if (!process.waitForFinished(10)) {
-            continue;
+            return false;
         }
     }
 
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        const QString stdOut = QString::fromLocal8Bit(process.readAllStandardOutput()).trimmed();
-        const QString stdErr = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-        resultMessage = QStringLiteral("ZIP 解压失败: %1")
-                            .arg(stdErr.isEmpty() ? QStringLiteral("未知错误") : stdErr);
-        if (!stdOut.isEmpty()) {
-            resultMessage += QStringLiteral("；输出: %1").arg(stdOut);
-        }
-        if (statusCallback) {
-            statusCallback(resultMessage);
-        }
-        return false;
+    // 剥离 ZIP 中常见的唯一顶层目录（如 AppName_v1.0/）
+    const QString effectiveExtractedDir = unwrapSingleTopLevelDir(extractedDir);
+    if (effectiveExtractedDir != extractedDir && statusCallback) {
+        statusCallback(QStringLiteral("检测到压缩包有顶层目录，已自动剥离: %1")
+                           .arg(QDir(extractedDir).relativeFilePath(effectiveExtractedDir)));
     }
 
     if (statusCallback) {
@@ -1378,7 +1737,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
     int copiedMissingFileCount = 0;
     QString syncMissingError;
     if (!syncMissingFilesAndDirs(
-            extractedDir,
+            effectiveExtractedDir,
             targetDir,
             createdDirCount,
             copiedMissingFileCount,
@@ -1409,7 +1768,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
         }
         QStringList missingFiles;
         for (const QString &relativePath : manifestFiles) {
-            const QString srcFilePath = QDir(extractedDir).absoluteFilePath(relativePath);
+            const QString srcFilePath = QDir(effectiveExtractedDir).absoluteFilePath(relativePath);
             if (!QFileInfo::exists(srcFilePath)) {
                 missingFiles << relativePath;
                 if (statusCallback) {
@@ -1434,7 +1793,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
 
         int done = 0;
         for (const QString &relativePath : manifestFiles) {
-            const QString srcFilePath = QDir(extractedDir).absoluteFilePath(relativePath);
+            const QString srcFilePath = QDir(effectiveExtractedDir).absoluteFilePath(relativePath);
             const QString dstFilePath = resolvePath(relativePath);
 
             QString replaceError;
@@ -1461,7 +1820,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
         }
         QString copyError;
         if (!copyDirectoryNonExe(
-                extractedDir,
+                effectiveExtractedDir,
                 targetDir,
                 copyError,
                 [&](int done, int total, const QString &relPath) {
@@ -1489,7 +1848,7 @@ bool AppManagerService::upgradeByZipExtract(const AppConfig &app,
             installProgressCallback(85);
         }
         QString replaceError;
-        if (!replaceExeFilesRecursively(extractedDir, targetDir, replacedExeCount, replaceError)) {
+        if (!replaceExeFilesRecursively(effectiveExtractedDir, targetDir, replacedExeCount, replaceError)) {
             resultMessage = QStringLiteral("ZIP 升级失败（EXE 替换阶段）: %1").arg(replaceError);
             if (statusCallback) {
                 statusCallback(resultMessage);
@@ -1582,20 +1941,6 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
             request.setRawHeader("Range", QByteArray("bytes=") + QByteArray::number(downloadedBytes) + "-");
         }
 
-        QIODevice::OpenMode openMode = QIODevice::WriteOnly;
-        if (useRange) {
-            openMode |= QIODevice::Append;
-        } else {
-            openMode |= QIODevice::Truncate;
-        }
-
-        QFile outFile(partPath);
-        if (!outFile.open(openMode)) {
-            errorMessage = QStringLiteral("无法写入临时下载文件: %1")
-                               .arg(QDir::toNativeSeparators(partPath));
-            return false;
-        }
-
         QNetworkReply *reply = m_networkManager.get(request);
         QEventLoop loop;
         QTimer timer;
@@ -1604,17 +1949,37 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         cancelPoll.setSingleShot(false);
 
         bool canceled = false;
+        // 先将数据缓冲到内存，待确认 HTTP 状态后再落盘，
+        // 避免服务端对 Range 请求返回 200（全量）时错误追加到 .part 文件。
+        QByteArray recvBuffer;
+        bool headerChecked = false;
+        bool serverNoResume = false; // 服务端对 Range 请求返回 200
 
         QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&]() {
             const QByteArray chunk = reply->readAll();
-            if (!chunk.isEmpty()) {
-                outFile.write(chunk);
+            if (chunk.isEmpty()) {
+                return;
             }
+            // 首包到达后检查 HTTP 状态
+            if (!headerChecked) {
+                headerChecked = true;
+                const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                if (useRange && status == 200) {
+                    // 服务端不支持 Range，返回了完整文件，标记后继续接收但最终丢弃续传数据
+                    serverNoResume = true;
+                }
+            }
+            recvBuffer.append(chunk);
         });
 
         if (progressCallback) {
             QObject::connect(reply, &QNetworkReply::downloadProgress, &loop,
                              [&](qint64 received, qint64 total) {
+                                 if (serverNoResume) {
+                                     // 服务端返回全量，显示全量进度
+                                     progressCallback(received, total > 0 ? total : -1);
+                                     return;
+                                 }
                                  qint64 shownTotal = total;
                                  if (useRange && total > 0) {
                                      shownTotal = downloadedBytes + total;
@@ -1654,6 +2019,12 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
             cancelPoll.stop();
         }
 
+        // 读取剩余数据
+        const QByteArray tail = reply->readAll();
+        if (!tail.isEmpty()) {
+            recvBuffer.append(tail);
+        }
+
         const bool timeout = !timer.isActive();
         const auto netError = reply->error();
         const QString netErrorStr = reply->errorString();
@@ -1661,70 +2032,119 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         const qint64 contentLength = reply->header(QNetworkRequest::ContentLengthHeader).toLongLong();
         const QByteArray contentRange = reply->rawHeader("Content-Range");
 
-        const QByteArray tail = reply->readAll();
-        if (!tail.isEmpty()) {
-            outFile.write(tail);
-        }
-
-        outFile.flush();
-        outFile.close();
-
-        if (contentRange.startsWith("bytes ")) {
-            const int slashPos = contentRange.lastIndexOf('/');
-            if (slashPos > 0) {
-                const QByteArray totalPart = contentRange.mid(slashPos + 1).trimmed();
-                bool ok = false;
-                const qlonglong parsedTotal = totalPart.toLongLong(&ok);
-                if (ok && parsedTotal > 0) {
-                    expectedTotal = parsedTotal;
-                }
-            }
-        } else if (httpStatus == 200 && contentLength > 0) {
-            expectedTotal = contentLength;
-        }
-
-        downloadedBytes = QFileInfo(partPath).exists() ? QFileInfo(partPath).size() : 0;
-
         reply->deleteLater();
 
         if (canceled) {
+            // 取消前将已接收数据写入 .part，供下次续传
+            if (!recvBuffer.isEmpty() && !serverNoResume) {
+                QFile outFile(partPath);
+                if (outFile.open(useRange ? (QIODevice::WriteOnly | QIODevice::Append)
+                                          : (QIODevice::WriteOnly | QIODevice::Truncate))) {
+                    outFile.write(recvBuffer);
+                    outFile.close();
+                }
+            }
             errorMessage = QStringLiteral("下载已取消");
             return false;
         }
 
-        if (useRange && httpStatus == 200) {
+        // 服务端对 Range 请求返回 200（不支持续传），切换全量重下
+        if (serverNoResume) {
             if (statusCallback) {
                 statusCallback(QStringLiteral("服务端不支持续传回包，切换为全量重下"));
             }
-            QFile::remove(partPath);
-            downloadedBytes = 0;
-            continue;
-        }
-
-        // HTTP 416: Range Not Satisfiable —— .part 文件比服务器文件大（文件已更新），从头重下
-        if (httpStatus == 416) {
-            if (statusCallback) {
-                statusCallback(QStringLiteral("服务端返回 416（Range 无效），删除断点文件后重新全量下载"));
+            // 将收到的全量数据直接写入 .part（Truncate 覆盖旧数据）
+            QFile outFile(partPath);
+            if (outFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                outFile.write(recvBuffer);
+                outFile.close();
             }
-            QFile::remove(partPath);
-            downloadedBytes = 0;
-            continue;
-        }
-
-        if (timeout || netError != QNetworkReply::NoError) {
-            if (attempt < maxRetry && downloadedBytes > 0) {
-                if (statusCallback) {
-                    statusCallback(QStringLiteral("下载中断，准备重试续传，当前已下载 %1 字节")
-                                       .arg(downloadedBytes));
+            if (httpStatus == 200 && contentLength > 0) {
+                expectedTotal = contentLength;
+            }
+            downloadedBytes = QFileInfo(partPath).exists() ? QFileInfo(partPath).size() : 0;
+            // 若全量数据已接收完整，直接跳到大小校验；否则重试
+            if (netError != QNetworkReply::NoError || timeout) {
+                // 数据未收完，下次从头开始（无法续传）
+                if (attempt < maxRetry) {
+                    continue;
                 }
+                errorMessage = QStringLiteral("服务端不支持断点续传且下载未完成");
+                return false;
+            }
+            // 数据收完，跳到下方的大小校验和文件落盘
+        } else {
+            // 正常路径：将缓冲数据写入 .part
+            {
+                QFile outFile(partPath);
+                const QIODevice::OpenMode openMode = useRange
+                    ? (QIODevice::WriteOnly | QIODevice::Append)
+                    : (QIODevice::WriteOnly | QIODevice::Truncate);
+                if (!outFile.open(openMode)) {
+                    errorMessage = QStringLiteral("无法写入临时下载文件: %1")
+                                       .arg(QDir::toNativeSeparators(partPath));
+                    return false;
+                }
+                outFile.write(recvBuffer);
+                outFile.flush();
+                outFile.close();
+            }
+
+            // 解析 Content-Range（不区分大小写）
+            const QByteArray contentRangeLower = contentRange.toLower().trimmed();
+            if (contentRangeLower.startsWith("bytes ")) {
+                const int slashPos = contentRangeLower.lastIndexOf('/');
+                if (slashPos > 0) {
+                    const QByteArray totalPart = contentRangeLower.mid(slashPos + 1).trimmed();
+                    bool ok = false;
+                    const qlonglong parsedTotal = totalPart.toLongLong(&ok);
+                    if (ok && parsedTotal > 0) {
+                        // 检测服务端文件是否发生变化（expectedTotal 与新解析值不一致）
+                        if (expectedTotal > 0 && parsedTotal != expectedTotal) {
+                            if (statusCallback) {
+                                statusCallback(QStringLiteral("服务端文件大小已变化（%1 -> %2），删除断点文件重新下载")
+                                                   .arg(expectedTotal).arg(parsedTotal));
+                            }
+                            QFile::remove(partPath);
+                            downloadedBytes = 0;
+                            expectedTotal = parsedTotal;
+                            continue;
+                        }
+                        expectedTotal = parsedTotal;
+                    }
+                }
+            } else if (httpStatus == 200 && contentLength > 0) {
+                expectedTotal = contentLength;
+            }
+
+            downloadedBytes = QFileInfo(partPath).exists() ? QFileInfo(partPath).size() : 0;
+
+            // HTTP 416: Range Not Satisfiable —— .part 文件比服务器文件大（文件已更新），从头重下
+            if (httpStatus == 416) {
+                if (statusCallback) {
+                    statusCallback(QStringLiteral("服务端返回 416（Range 无效），删除断点文件后重新全量下载"));
+                }
+                QFile::remove(partPath);
+                downloadedBytes = 0;
                 continue;
             }
-            errorMessage = timeout
-                               ? QStringLiteral("下载超时，已下载 %1 字节").arg(downloadedBytes)
-                               : QStringLiteral("网络异常中断：%1（已下载 %2 字节）").arg(netErrorStr).arg(downloadedBytes);
-            return false;
+
+            if (timeout || netError != QNetworkReply::NoError) {
+                if (attempt < maxRetry && downloadedBytes > 0) {
+                    if (statusCallback) {
+                        statusCallback(QStringLiteral("下载中断，准备重试续传，当前已下载 %1 字节")
+                                           .arg(downloadedBytes));
+                    }
+                    continue;
+                }
+                errorMessage = timeout
+                                   ? QStringLiteral("下载超时，已下载 %1 字节").arg(downloadedBytes)
+                                   : QStringLiteral("网络异常中断：%1（已下载 %2 字节）").arg(netErrorStr).arg(downloadedBytes);
+                return false;
+            }
         }
 
+        // 大小校验
         if (expectedTotal > 0) {
             if (downloadedBytes < expectedTotal) {
                 if (attempt < maxRetry) {
@@ -1741,7 +2161,17 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
                 return false;
             }
             if (downloadedBytes > expectedTotal) {
-                errorMessage = QStringLiteral("下载文件大小异常，期望 %1 字节，实际 %2 字节")
+                // 大小超出预期（可能是陈旧的 .part 文件），删除后重试
+                if (statusCallback) {
+                    statusCallback(QStringLiteral("文件大小异常（期望 %1 字节，实际 %2 字节），删除断点文件重新下载")
+                                       .arg(expectedTotal).arg(downloadedBytes));
+                }
+                QFile::remove(partPath);
+                downloadedBytes = 0;
+                if (attempt < maxRetry) {
+                    continue;
+                }
+                errorMessage = QStringLiteral("下载文件大小异常，期望 %1 字节，实际 %2 字节（已用尽重试次数）")
                                    .arg(expectedTotal)
                                    .arg(downloadedBytes);
                 return false;
@@ -1756,8 +2186,9 @@ bool AppManagerService::downloadFileWithResume(const QUrl &url,
         }
 
         if (statusCallback) {
-            statusCallback(QStringLiteral("下载文件写入完成: %1")
-                               .arg(QDir::toNativeSeparators(targetFilePath)));
+            statusCallback(QStringLiteral("下载文件写入完成: %1（%2 字节）")
+                               .arg(QDir::toNativeSeparators(targetFilePath))
+                               .arg(downloadedBytes));
         }
 
         if (progressCallback) {

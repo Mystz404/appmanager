@@ -4,7 +4,7 @@
 ; 应用显示名称（安装向导、开始菜单、卸载信息中会显示）
 #define MyAppName "AppManager"
 ; 应用版本号（用于安装包版本与升级判断）
-#define MyAppVersion "1.0.3.14"
+#define MyAppVersion "1.0.3.20"
 
 ; 发布者名称（控制面板卸载列表中的发布者）
 #define MyAppPublisher "Kgooer"
